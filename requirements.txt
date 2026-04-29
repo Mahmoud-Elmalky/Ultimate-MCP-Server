@@ -1,0 +1,12 @@
+httpx
+pytz
+yfinance
+pandas
+PyPDF2
+beautifulsoup4
+mcp
+google-api-python-client
+youtube-transcript-api
+tavily-python
+duckduckgo-search
+python-dotenv
