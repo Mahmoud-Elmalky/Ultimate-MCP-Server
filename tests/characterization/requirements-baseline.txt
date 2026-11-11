@@ -1,0 +1,20 @@
+# Phase 0 baseline pins.
+# Mirrors the package versions observed in the user's live interpreter
+# (C:\Program Files\Python312) that LM Studio uses to launch ultimate_mcp_server.py.
+# Used ONLY to run characterization tests against the legacy single-file server.
+# The unpinned root requirements.txt currently resolves mcp 2.x, which breaks
+# `from mcp.server.fastmcp import FastMCP` (see docs/reports/phase-00-baseline.md).
+mcp==1.27.0
+youtube-transcript-api==1.2.4
+duckduckgo-search==8.1.1
+tavily-python==0.7.23
+yfinance==1.0
+pandas==2.3.3
+PyPDF2==3.0.1
+httpx==0.28.1
+pydantic==2.12.5
+beautifulsoup4==4.14.3
+google-api-python-client==2.194.0
+pytz==2025.2
+python-dotenv==1.2.1
+pytest==9.0.3
