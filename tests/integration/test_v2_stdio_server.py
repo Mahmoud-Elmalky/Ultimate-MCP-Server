@@ -39,7 +39,12 @@ def test_doctor_and_profiles_without_api_keys(tmp_path: Path, monkeypatch) -> No
     assert forbidden.isdisjoint(set(report["enabled_tools"]))
 
     browser_report = build_doctor_report(profile_override=ProfileName.BROWSER)
-    assert browser_report["enabled_tools"] == ["get_current_time"]
+    if browser_report["optional_groups"]["browser"]["all_installed"]:
+        assert browser_report["enabled_tool_count"] == 15
+        assert "browser_open" in browser_report["enabled_tools"]
+        assert "get_current_time" in browser_report["enabled_tools"]
+    else:
+        assert browser_report["enabled_tools"] == ["get_current_time"]
 
     assert cli_main(["doctor"]) == 0
     assert cli_main(["doctor", "--json"]) == 0

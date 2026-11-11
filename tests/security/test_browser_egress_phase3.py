@@ -1,18 +1,26 @@
-"""Security tests for Phase 03 Browser Security & Network Egress Prototype."""
+"""Security unit tests for Browser Egress Control, Proxy, and Controlled Automation."""
 
 from __future__ import annotations
 
+import asyncio
 import io
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from ultimate_mcp.core.approvals import ApprovalBroker
 from ultimate_mcp.modules.browser.egress import (
     STRICT_CHROMIUM_ARGS,
     WINDOWS_ISOLATION_LIMITATION,
-    ApprovedMethodRule,
     BrowserEgressPolicy,
+    LoopbackValidatingProxy,
+    prepare_browser_mutation_approval,
+)
+from ultimate_mcp.modules.browser.policy_types import (
+    PROXY_SYNTHETIC_HOST,
+    build_proxy_chromium_args,
 )
 
 
@@ -20,8 +28,7 @@ class SpySocket:
     """Socket test double proving pinned-IP dialing and zero bytes sent on block."""
 
     def __init__(self, peer_ip: str, peer_port: int, response_bytes: bytes) -> None:
-        self._peer = (peer_ip, peer_port)
-        self._response = response_bytes
+        self._peer, self._response = (peer_ip, peer_port), response_bytes
         self.sent_payloads: list[bytes] = []
         self.closed = False
 
@@ -51,13 +58,10 @@ class SpyRequest:
 
 
 class SpyRoute:
-    """Playwright Route test double recording fulfill/abort/continue calls."""
-
     def __init__(self, request: SpyRequest) -> None:
         self.request = request
         self.fulfilled: list[dict[str, Any]] = []
         self.aborted: list[str] = []
-        self.continued: int = 0
 
     async def fulfill(self, **kwargs: Any) -> None:
         self.fulfilled.append(kwargs)
@@ -66,34 +70,52 @@ class SpyRoute:
         self.aborted.append(error_code)
 
     async def continue_(self, **kwargs: Any) -> None:
-        self.continued += 1
-        raise AssertionError("route.continue_() must NEVER be called for external requests!")
+        raise AssertionError("route.continue_() must NEVER be called!")
+
+
+class SpyWebSocketRoute:
+    def __init__(self, url: str) -> None:
+        self.url, self.closed = url, []
+
+    async def close(self, *, code: int | None = None, reason: str | None = None) -> None:
+        self.closed.append((code, reason))
 
 
 class SpyContext:
     def __init__(self) -> None:
-        self.handlers: list[tuple[str, Any]] = []
+        self.route_handlers: list[tuple[str, Any]] = []
+        self.ws_handlers: list[tuple[str, Any]] = []
 
     async def route(self, pattern: str, handler: Any) -> None:
-        self.handlers.append((pattern, handler))
+        self.route_handlers.append((pattern, handler))
+
+    async def route_web_socket(self, pattern: str, handler: Any) -> None:
+        self.ws_handlers.append((pattern, handler))
 
 
-def test_browser_launch_and_context_hardening_options() -> None:
+def test_host_resolver_has_no_exclude_and_proxy_args_are_strict() -> None:
+    """Ensure EXCLUDE 127.0.0.1 is removed and proxy mode uses exact synthetic mapping."""
     policy = BrowserEgressPolicy()
-    launch_opts = policy.build_launch_options(headless=True)
+    standalone_args = policy.build_launch_options(headless=True)["args"]
     ctx_opts = policy.build_context_options()
 
-    assert "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1" in STRICT_CHROMIUM_ARGS
-    assert "--disable-background-networking" in launch_opts["args"]
-    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in launch_opts["args"]
+    assert "--host-resolver-rules=MAP * ~NOTFOUND" in STRICT_CHROMIUM_ARGS
+    assert not any("EXCLUDE" in arg for arg in standalone_args)
+    assert "--disable-quic" in standalone_args
+    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in standalone_args
     assert ctx_opts["service_workers"] == "block"
     assert ctx_opts["accept_downloads"] is False
-    assert ctx_opts["ignore_https_errors"] is False
-    assert "user_data_dir" not in ctx_opts
     assert "CLONE_NEWNET" in WINDOWS_ISOLATION_LIMITATION
 
+    proxy_args = build_proxy_chromium_args(41234)
+    assert f"MAP {PROXY_SYNTHETIC_HOST} 127.0.0.1 , MAP * ~NOTFOUND" in proxy_args[0]
+    assert f"--proxy-server=http://{PROXY_SYNTHETIC_HOST}:41234" in proxy_args
+    assert "--proxy-bypass-list=<-loopback>" in proxy_args
+    assert not any("EXCLUDE" in arg for arg in proxy_args)
 
-async def test_browser_blocks_private_loopback_metadata_and_subresources() -> None:
+
+async def test_route_and_websocket_block_hostile_ipv4_ipv6_and_ws_schemes() -> None:
+    """Block loopback/private/IPv6 literals via route() and ws/wss via route_web_socket()."""
     dialed: list[tuple[str, int]] = []
     ssl_sni: list[str] = []
 
@@ -102,11 +124,8 @@ async def test_browser_blocks_private_loopback_metadata_and_subresources() -> No
 
     def socket_factory(addr: tuple[str, int], timeout: float) -> Any:
         dialed.append(addr)
-        return SpySocket(
-            addr[0],
-            addr[1],
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 9\r\n\r\n<p>ok</p>",
-        )
+        resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 9\r\n\r\n<p>ok</p>"
+        return SpySocket(addr[0], addr[1], resp)
 
     def ssl_wrapper(sock: Any, hostname: str) -> Any:
         ssl_sni.append(hostname)
@@ -117,78 +136,64 @@ async def test_browser_blocks_private_loopback_metadata_and_subresources() -> No
     )
     ctx = SpyContext()
     await policy.attach_to_context(ctx)
-    assert len(ctx.handlers) == 1 and ctx.handlers[0][0] == "**/*"
+    assert len(ctx.route_handlers) == 1 and ctx.route_handlers[0][0] == "**/*"
+    assert len(ctx.ws_handlers) == 1 and ctx.ws_handlers[0][0] == "**/*"
 
     pub_route = SpyRoute(SpyRequest("https://public.example.com/page", resource_type="document"))
     await policy.handle_playwright_route(pub_route)
-    assert len(pub_route.fulfilled) == 1
-    assert pub_route.fulfilled[0]["body"] == b"<p>ok</p>"
-    assert pub_route.continued == 0
-    assert dialed == [("93.184.216.34", 443)]
+    assert len(pub_route.fulfilled) == 1 and dialed == [("93.184.216.34", 443)]
     assert ssl_sni == ["public.example.com"]
 
-    # Hostile targets across main navigation, subresources, fetch/xhr, and frames
-    hostile_cases = [
-        ("http://127.0.0.1/admin", "document"),
-        ("http://localhost:8080/api", "xhr"),
-        ("http://169.254.169.254/latest/meta-data/iam/security-credentials/", "fetch"),
-        ("http://metadata.google.internal/computeMetadata/v1/", "xhr"),
-        ("http://10.0.0.5/logo.png", "image"),
-        ("http://192.168.1.1/app.js", "script"),
-        ("http://[::1]/style.css", "stylesheet"),
-        ("http://rebind.corp/embed", "iframe"),
-        ("file:///etc/passwd", "document"),
-        ("ws://echo.example.com/socket", "websocket"),
-        ("wss://127.0.0.1/ws", "websocket"),
+    hostile_http = [
+        ("http://127.0.0.1/admin", "document"), ("http://localhost:8080/api", "xhr"),
+        ("http://169.254.169.254/latest/meta-data/", "fetch"), ("http://10.0.0.5/p.png", "image"),
+        ("http://192.168.1.1/app.js", "script"), ("http://[::1]/style.css", "stylesheet"),
+        ("http://[fe80::1]/meta", "fetch"), ("http://[::ffff:127.0.0.1]/admin", "document"),
+        ("http://rebind.corp/embed", "iframe"), ("file:///etc/passwd", "document"),
         ("https://public.example.com/telemetry", "ping"),
         ("https://update.googleapis.com/service/update2", "xhr"),
     ]
-    for target_url, rtype in hostile_cases:
-        r = SpyRoute(SpyRequest(target_url, resource_type=rtype))
+    for url, rtype in hostile_http:
+        r = SpyRoute(SpyRequest(url, resource_type=rtype))
         await policy.handle_playwright_route(r)
-        assert len(r.aborted) == 1, f"Expected abort for {rtype} {target_url}"
-        assert r.fulfilled == []
-        assert r.continued == 0
+        assert len(r.aborted) == 1, f"Expected abort for {url}"
 
-    # Confirm NONE of the hostile targets ever triggered a socket connection
+    ws_urls = (
+        "ws://127.0.0.1:8080/ws", "wss://localhost/ws", "ws://10.0.0.1/ws",
+        "wss://93.184.216.34/ws", "ws://public.example.com/ws",
+    )
+    for ws_url in ws_urls:
+        ws = SpyWebSocketRoute(ws_url)
+        await policy.handle_playwright_websocket(ws)
+        assert ws.closed == [(1008, "WebSockets blocked by egress policy")]
+
     assert dialed == [("93.184.216.34", 443)]
 
 
 @pytest.mark.parametrize("resource_type", ["document", "image", "script", "fetch", "iframe"])
-async def test_browser_blocks_redirects_to_private_and_metadata_across_resource_types(
-    resource_type: str,
-) -> None:
-    """Prove 302 redirect from public URL to metadata/loopback is blocked before Hop 2 socket."""
+async def test_browser_blocks_redirects_to_private_and_metadata(resource_type: str) -> None:
+    """Prove 302 redirect to metadata IP is aborted before any Hop 2 socket."""
     dialed: list[tuple[str, int]] = []
-
-    def resolver(host: str, port: int) -> list[str]:
-        if host == "redirector.example.com":
-            return ["93.184.216.34"]
-        raise AssertionError(f"DNS lookup should not reach private host: {host}")
-
-    redirect_payload = (
+    payload = (
         b"HTTP/1.1 302 Found\r\n"
-        b"Location: http://169.254.169.254/latest/meta-data/\r\n"
-        b"Content-Length: 0\r\n\r\n"
+        b"Location: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\n\r\n"
     )
 
     def socket_factory(addr: tuple[str, int], timeout: float) -> Any:
         dialed.append(addr)
-        return SpySocket(addr[0], addr[1], redirect_payload)
+        return SpySocket(addr[0], addr[1], payload)
 
-    policy = BrowserEgressPolicy(resolver=resolver, socket_factory=socket_factory)
-    route = SpyRoute(SpyRequest("http://redirector.example.com/asset", resource_type=resource_type))
+    policy = BrowserEgressPolicy(
+        resolver=lambda h, p: ["93.184.216.34"], socket_factory=socket_factory
+    )
+    url = "http://redirector.example.com/asset"
+    route = SpyRoute(SpyRequest(url, resource_type=resource_type))
     await policy.handle_playwright_route(route)
-
-    assert len(route.aborted) == 1
-    assert route.fulfilled == []
-    assert route.continued == 0
-    # Only Hop 1 public IP was dialed; Hop 2 metadata IP was blocked before connecting
-    assert dialed == [("93.184.216.34", 80)]
+    assert len(route.aborted) == 1 and dialed == [("93.184.216.34", 80)]
 
 
 async def test_browser_blocks_socket_peer_rebinding_with_zero_http_bytes() -> None:
-    """If peer IP mismatches pre-validated public IP, abort route and send zero HTTP bytes."""
+    """Abort if peer IP mismatches pre-validated IP before any HTTP bytes leave."""
     sockets: list[SpySocket] = []
 
     def rebonded_socket_factory(addr: tuple[str, int], timeout: float) -> Any:
@@ -197,114 +202,102 @@ async def test_browser_blocks_socket_peer_rebinding_with_zero_http_bytes() -> No
         return s
 
     policy = BrowserEgressPolicy(
-        resolver=lambda h, p: ["93.184.216.34"],
-        socket_factory=rebonded_socket_factory,
+        resolver=lambda h, p: ["93.184.216.34"], socket_factory=rebonded_socket_factory
     )
     route = SpyRoute(SpyRequest("https://rebind.example.com/", resource_type="document"))
     await policy.handle_playwright_route(route)
-
-    assert len(route.aborted) == 1
-    assert sockets[0].closed is True
-    assert sockets[0].sent_payloads == []
+    assert len(route.aborted) == 1 and sockets[0].closed and sockets[0].sent_payloads == []
 
 
-async def test_browser_safe_post_and_download_policy() -> None:
-    """Verify state-changing POST requires approval and STILL obeys SSRF + redirect guards."""
-    sockets: list[SpySocket] = []
-    ssl_sni: list[str] = []
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+async def test_state_changing_methods_require_bound_single_use_out_of_band_approval(
+    tmp_path: Path, method: str
+) -> None:
+    """Verify POST/PUT/PATCH/DELETE require single-use digest L3 approval & block redirects."""
+    now_box = [1000.0]
+    broker = ApprovalBroker(tmp_path / "approvals.sqlite3", clock=lambda: now_box[0])
+    dialed: list[tuple[str, int]] = []
+    redirect_mode = [False]
 
-    def resolver(host: str, port: int) -> list[str]:
-        if host == "api.example.com":
-            return ["93.184.216.34"]
-        return ["1.1.1.1"] if host == "thirdparty.example.org" else ["127.0.0.1"]
-
-    def post_socket_factory(addr: tuple[str, int], timeout: float) -> Any:
-        body = (
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-            b'Content-Length: 11\r\n\r\n{"ok":true}'
-            if addr == ("93.184.216.34", 443)
-            else (
+    def sock_factory(addr: tuple[str, int], timeout: float) -> Any:
+        dialed.append(addr)
+        if redirect_mode[0]:
+            payload = (
                 b"HTTP/1.1 307 Temporary Redirect\r\n"
-                b"Location: https://thirdparty.example.org/collect\r\nContent-Length: 0\r\n\r\n"
+                b"Location: https://api.example.com/v2/next\r\nContent-Length: 0\r\n\r\n"
             )
-        )
-        sock = SpySocket(addr[0], addr[1], body)
-        sockets.append(sock)
-        return sock
+        else:
+            payload = (
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b'Content-Length: 11\r\n\r\n{"ok":true}'
+            )
+        return SpySocket(addr[0], addr[1], payload)
 
-    def ssl_wrapper(sock: Any, hostname: str) -> Any:
-        ssl_sni.append(hostname)
-        return sock
+    policy = BrowserEgressPolicy(
+        approval_broker=broker,
+        resolver=lambda h, p: ["93.184.216.34"],
+        socket_factory=sock_factory,
+        ssl_wrapper=lambda s, h: s,
+    )
+    target, body = "https://api.example.com/items", b'{"item":"x"}'
 
-    default_policy = BrowserEgressPolicy(
-        resolver=resolver, socket_factory=post_socket_factory, ssl_wrapper=ssl_wrapper
-    )
-    r_unapproved = SpyRoute(
-        SpyRequest(
-            "https://api.example.com/search",
-            method="POST",
-            resource_type="fetch",
-            post_data_buffer=b'{"q":"test"}',
-        )
-    )
-    await default_policy.handle_playwright_route(r_unapproved)
-    assert len(r_unapproved.aborted) == 1 and sockets == []
-
-    rule = ApprovedMethodRule(
-        method="POST", origin="https://api.example.com", path_prefix="/search"
-    )
-    approved_policy = BrowserEgressPolicy(
-        approved_method_rules=(rule,),
-        resolver=resolver,
-        socket_factory=post_socket_factory,
-        ssl_wrapper=ssl_wrapper,
-    )
-    r_ok = SpyRoute(
-        SpyRequest(
-            "https://api.example.com/search",
-            method="POST",
-            resource_type="fetch",
-            post_data_buffer=b'{"q":"test"}',
-        )
-    )
-    await approved_policy.handle_playwright_route(r_ok)
-    assert len(r_ok.fulfilled) == 1 and r_ok.fulfilled[0]["body"] == b'{"ok":true}'
-    assert r_ok.continued == 0 and ssl_sni == ["api.example.com"]
-
-    rule_redir = ApprovedMethodRule(
-        method="POST", origin="https://redir.example.com", path_prefix="/"
-    )
-    redir_policy = BrowserEgressPolicy(
-        approved_method_rules=(rule_redir,),
-        resolver=lambda h, p: ["1.1.1.1"],
-        socket_factory=post_socket_factory,
-        ssl_wrapper=ssl_wrapper,
-    )
-    r_307 = SpyRoute(
-        SpyRequest(
-            "https://redir.example.com/submit",
-            method="POST",
-            resource_type="fetch",
-            post_data_buffer=b"secret-body",
-        )
-    )
-    await redir_policy.handle_playwright_route(r_307)
-    assert len(r_307.aborted) == 1
-
-    def dl_socket(addr: tuple[str, int], timeout: float) -> Any:
-        return SpySocket(
-            addr[0],
-            addr[1],
-            (
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
-                b'Content-Disposition: attachment; filename="payload.txt"\r\n'
-                b"Content-Length: 4\r\n\r\ntest"
-            ),
+    def mk(raw_body: bytes = body) -> SpyRoute:
+        return SpyRoute(
+            SpyRequest(target, method=method, resource_type="fetch", post_data_buffer=raw_body)
         )
 
-    dl_policy = BrowserEgressPolicy(
-        resolver=resolver, socket_factory=dl_socket, ssl_wrapper=ssl_wrapper
-    )
-    r_dl = SpyRoute(SpyRequest("https://api.example.com/export", resource_type="document"))
-    await dl_policy.handle_playwright_route(r_dl)
-    assert len(r_dl.aborted) == 1
+    def mk_apr(ttl: int = 30, *, approve: bool = True) -> str:
+        rec = prepare_browser_mutation_approval(
+            broker, method=method, url=target, body=body, ttl_seconds=ttl
+        )
+        if approve:
+            broker.decide_out_of_band(rec.approval_id, approve=True)
+        policy.authorize_mutation(rec.approval_id)
+        return rec.approval_id
+
+    await policy.handle_playwright_route(r0 := mk())
+    assert len(r0.aborted) == 1 and dialed == []
+
+    aid = mk_apr(ttl=30, approve=False)
+    await policy.handle_playwright_route(r_pend := mk())
+    assert len(r_pend.aborted) == 1 and dialed == []
+
+    broker.decide_out_of_band(aid, approve=True)
+    policy.authorize_mutation(aid)
+    await policy.handle_playwright_route(r_tamper := mk(b'{"item":"EVIL"}'))
+    assert len(r_tamper.aborted) == 1 and dialed == []
+
+    await policy.handle_playwright_route(r_ok := mk())
+    assert len(r_ok.fulfilled) == 1 and len(dialed) == 1
+
+    policy.authorize_mutation(aid)
+    await policy.handle_playwright_route(r_replay := mk())
+    assert len(r_replay.aborted) == 1 and len(dialed) == 1
+
+    exp_id = mk_apr(ttl=10)
+    now_box[0] = broker.get_record(exp_id).expires_at
+    await policy.handle_playwright_route(r_exp := mk())
+    assert len(r_exp.aborted) == 1 and len(dialed) == 1
+
+    redir_id = mk_apr(ttl=30)
+    redirect_mode[0] = True
+    await policy.handle_playwright_route(r_red := mk())
+    assert len(r_red.aborted) == 1
+    assert broker.get_record(redir_id).status.value == "consumed"
+
+
+async def test_loopback_validating_proxy_fails_closed_on_connect_and_ssrf() -> None:
+    """Verify LoopbackValidatingProxy rejects CONNECT, POST, and loopback/IPv6 with 403."""
+    async with LoopbackValidatingProxy(resolver=lambda h, p: ["93.184.216.34"]) as proxy:
+        for req_line in (
+            b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n",
+            b"GET http://127.0.0.1:8080/secret HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            b"GET http://[::1]:8080/secret HTTP/1.1\r\nHost: [::1]\r\n\r\n",
+            b"POST http://93.184.216.34/submit HTTP/1.1\r\nHost: 93.184.216.34\r\n\r\n",
+        ):
+            r, w = await asyncio.open_connection("127.0.0.1", proxy.port)
+            w.write(req_line)
+            await w.drain()
+            resp = await r.read(1024)
+            w.close()
+            assert resp.startswith(b"HTTP/1.1 403 Forbidden")

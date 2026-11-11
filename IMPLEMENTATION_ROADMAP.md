@@ -7,7 +7,7 @@
 | 00 | Baseline & Audit | Verified baseline, characterization tests, risk register | Current tools and working-tree state documented; baseline can be reproduced | `complete` (commit `61a9d45`) |
 | 01 | Core Foundation | Package structure, config, registry, results, permissions, approvals, logging | Core starts without optional keys; security tests pass | `complete` (commit `36166b3`, checkpoint `2385d3e`) |
 | 02 | Research & Utilities | Provider-based research, current data, safe calculator, legacy utility migration | Provider failures isolated; outputs have provenance/freshness | `complete` (branch `feat/v2-phase-2`) |
-| 03 | Browser & Documents | Playwright adapter and bounded multi-format document processing | Hostile URLs/files and unapproved side effects blocked | `in_progress` (next: Browser Security & Egress prototype) |
+| 03 | Browser & Documents | Playwright adapter and bounded multi-format document processing | Hostile URLs/files and unapproved side effects blocked | `in_progress` (Browser Security + 14-tool Browser Engine complete; next: Document Intelligence) |
 | 04 | Coding & System | Project-aware code tools, Git, tests, diagnostics, constrained commands | Workspace boundary and execution approval tests pass | `planned` |
 | 05 | Data & Media | Spreadsheet/database/data/media support via optional extras | Core install remains lightweight; large file limits verified | `planned` |
 | 06 | Memory & Knowledge | Explicit local memory, FTS5 search, optional embeddings/vector adapter | Scope isolation, deletion, retention, and provenance tests pass | `planned` |

@@ -69,10 +69,13 @@ Approval record should contain: UUID, action type, canonical arguments digest, r
 
 ## 7. Browser controls
 
-- Start a separate Playwright context without access to the user's normal browser profile.
-- Apply navigation allow/deny rules and download directory constraints.
-- Downloads require approval where files persist. Uploads and form submissions require explicit L3 approval bound to exact file/form/action.
-- Block file URLs and local browser access unless a specific, user-configured local testing profile allows it.
+- Start an isolated ephemeral Playwright context without access to the user's normal browser profile (`service_workers="block"`, `accept_downloads=False`).
+- Enforce three-layer browser network egress control:
+  - Chromium flags (`--host-resolver-rules=MAP egress-proxy.invalid 127.0.0.1 , MAP * ~NOTFOUND`, `--proxy-server=http://egress-proxy.invalid:<port>`, `--proxy-bypass-list=<-loopback>`, `--disable-quic`, `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`) with zero `EXCLUDE 127.0.0.1` exceptions.
+  - Playwright `context.route_web_socket("**/*", ...)` (aborting all `ws://` and `wss://` by default) and `context.route("**/*", ...)` fulfilling strictly via pinned-IP `fetch_safe_url` (never `route.continue_()`).
+  - Fail-closed `LoopbackValidatingProxy` blocking raw `CONNECT` tunnels and literal IPv4/IPv6 loopback/private bypasses with `403`.
+- Downloads require approval where files persist. All state-changing HTTP methods (`POST`, `PUT`, `PATCH`, `DELETE`) and uploads block by default and require single-use, TTL-bounded out-of-band L3 `ApprovalBroker` records bound to method, canonical URL, and SHA-256 payload digest (never reusable after redirects).
+- Windows limitation: without Admin WFP drivers / kernel namespaces (`CLONE_NEWNET`), isolation relies on Chromium network-stack lockdown and proxy/route enforcement; sandbox escapes or native plugins bypassing Chromium's proxy stack require OS firewall controls.
 - Do not bypass CAPTCHA, authentication, anti-bot protections, paywalls, or access controls.
 - Treat page text, labels, hidden content, and scripts as untrusted data, not instructions.
 

@@ -22,6 +22,11 @@ from ultimate_mcp.core.models import ToolResult
 from ultimate_mcp.core.permissions import PermissionLevel
 from ultimate_mcp.core.redaction import configure_logging
 from ultimate_mcp.core.registry import ToolRegistry, ToolSpec, is_package_available
+from ultimate_mcp.modules.browser.manager import (
+    BrowserSessionManager,
+    check_playwright_browser_binaries,
+)
+from ultimate_mcp.modules.browser.tools import register_browser_tools
 from ultimate_mcp.modules.documents.reader import read_workspace_text_file_service
 from ultimate_mcp.modules.research.tools import register_research_tools
 from ultimate_mcp.modules.system.actions import (
@@ -63,6 +68,7 @@ class GatewayRuntime:
     broker: ApprovalBroker
     cache: PerClassTTLCache[Any]
     mcp: MCPServer
+    browser_manager: BrowserSessionManager | None = None
 
 
 def _adapt_result(result: ToolResult, settings: Settings) -> CallToolResult:
@@ -83,10 +89,16 @@ def build_registry(
     executor: ExecutionManager,
     broker: ApprovalBroker,
     cache: PerClassTTLCache[Any] | None = None,
+    browser_manager: BrowserSessionManager | None = None,
 ) -> ToolRegistry:
     """Construct the ``ToolRegistry`` with all implemented v2 tools."""
     registry = ToolRegistry()
     active_cache = cache if cache is not None else PerClassTTLCache()
+    active_browser = (
+        browser_manager
+        if browser_manager is not None
+        else BrowserSessionManager(approval_broker=broker)
+    )
 
     tavily_key = settings.tavily_api_key.get_secret_value() if settings.tavily_api_key else None
     youtube_key = settings.youtube_api_key.get_secret_value() if settings.youtube_api_key else None
@@ -116,6 +128,14 @@ def build_registry(
         tavily_provider=tavily_provider,
         ddg_provider=ddg_provider,
         academic_provider=academic_provider,
+    )
+    register_browser_tools(
+        registry=registry,
+        settings=settings,
+        executor=executor,
+        broker=broker,
+        manager=active_browser,
+        adapt_result=_adapt_result,
     )
 
     async def read_text_file(
@@ -313,7 +333,14 @@ def create_gateway(
         known_secrets=cfg.known_secret_values(),
     )
     cache: PerClassTTLCache[Any] = PerClassTTLCache()
-    registry = build_registry(cfg, executor, broker, cache=cache)
+    browser_manager = BrowserSessionManager(approval_broker=broker)
+    registry = build_registry(
+        cfg,
+        executor,
+        broker,
+        cache=cache,
+        browser_manager=browser_manager,
+    )
 
     mcp = MCPServer("Ultimate-MCP-Server-v2")
     for spec in registry.enabled_specs(cfg, cfg.profile):
@@ -326,6 +353,7 @@ def create_gateway(
         broker=broker,
         cache=cache,
         mcp=mcp,
+        browser_manager=browser_manager,
     )
 
 
@@ -390,6 +418,7 @@ def build_doctor_report(
             "health": provider_health,
         },
         "optional_groups": optional_groups,
+        "browser": check_playwright_browser_binaries(),
         "enabled_tool_count": len(enabled_names),
         "enabled_tools": enabled_names,
         "tools": tools_report,

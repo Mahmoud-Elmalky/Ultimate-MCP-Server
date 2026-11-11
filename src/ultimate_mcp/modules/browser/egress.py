@@ -1,15 +1,20 @@
-"""Playwright Browser Security & Network Egress Control (Phase 03 Slice 3.1).
+"""Playwright Browser Security & Network Egress Control (Phase 03 Slice 3.1.1).
 
-Security design (`phases/PHASE-03_BROWSER_DOCUMENTS.md` §A.1):
-- Chromium launches with ``--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1`` and
-  background-networking / WebRTC non-proxied UDP disabled so Chromium cannot bypass DNS
-  validation or emit background/STUN probes.
-- Contexts run with ``service_workers="block"``, ``accept_downloads=False``, and ephemeral
-  storage (never attached to a personal browser profile).
-- ``context.route("**/*", ...)`` intercepts ALL requests (navigation, redirects, subresources,
-  fetch/XHR, WebSockets, ping) and NEVER calls ``route.continue_()`` for external URLs.
-- Permitted requests are fulfilled exclusively via ``fetch_safe_url`` (pinned-IP TCP socket +
-  pre-TLS peer-IP verification + per-hop redirect validation).
+Enforces multi-layer browser egress control:
+1. Chromium launch lockdown: ``--host-resolver-rules=MAP * ~NOTFOUND`` (zero ``EXCLUDE
+   127.0.0.1``) in standalone mode, or ``MAP egress-proxy.invalid 127.0.0.1 , MAP * ~NOTFOUND``
+   with ``--proxy-server=http://egress-proxy.invalid:<port>`` and
+   ``--proxy-bypass-list=<-loopback>`` plus ``--disable-quic`` and disabled WebRTC non-proxied
+   UDP.
+2. Context isolation: ephemeral context (``service_workers="block"``, ``accept_downloads=False``).
+3. Playwright ``context.route_web_socket("**/*", ...)`` aborts all ``ws://`` and ``wss://`` by
+   default before any page is created.
+4. Playwright ``context.route("**/*", ...)`` intercepts all navigations, redirects, subresources,
+   scripts, images, iframes, fetch/XHR, and pings, fulfilling solely via pinned-IP
+   ``fetch_safe_url`` (never ``route.continue_()`` for external URLs).
+5. All state-changing HTTP methods (``POST``, ``PUT``, ``PATCH``, ``DELETE``) block by default
+   and require a valid single-use, non-expired, payload-digest-bound out-of-band L3
+   ``ApprovalBroker`` record (and reject redirects with ``max_redirects=0``).
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import asyncio
 import urllib.parse
 from typing import Any
 
+from ultimate_mcp.core.approvals import ApprovalBroker
 from ultimate_mcp.core.http import (
     SAFE_AUTONOMOUS_METHODS,
     ResolverFunc,
@@ -36,25 +42,27 @@ from ultimate_mcp.modules.browser.policy_types import (
     BLOCKED_BACKGROUND_HOSTS,
     BLOCKED_RESOURCE_TYPES,
     BROWSER_ALLOWED_CONTENT_TYPES,
+    DEFAULT_BROWSER_SESSION_ID,
     HOP_BY_HOP_HEADERS,
+    STATE_CHANGING_METHODS,
     STRICT_CHROMIUM_ARGS,
+    WEBRTC_DISABLE_INIT_SCRIPT,
     WINDOWS_ISOLATION_LIMITATION,
-    ApprovedMethodRule,
     EgressAuditEvent,
     EgressDecision,
+    MutationApprovalGate,
+    build_proxy_chromium_args,
+    build_windows_firewall_guidance,
+    prepare_browser_mutation_approval,
 )
+from ultimate_mcp.modules.browser.proxy import LoopbackValidatingProxy
 
 __all__ = [
-    "BLOCKED_BACKGROUND_HOSTS",
-    "BLOCKED_RESOURCE_TYPES",
-    "BROWSER_ALLOWED_CONTENT_TYPES",
-    "HOP_BY_HOP_HEADERS",
-    "STRICT_CHROMIUM_ARGS",
-    "WINDOWS_ISOLATION_LIMITATION",
-    "ApprovedMethodRule",
-    "BrowserEgressPolicy",
-    "EgressAuditEvent",
-    "EgressDecision",
+    "BLOCKED_BACKGROUND_HOSTS", "BLOCKED_RESOURCE_TYPES", "BROWSER_ALLOWED_CONTENT_TYPES",
+    "DEFAULT_BROWSER_SESSION_ID", "HOP_BY_HOP_HEADERS", "STATE_CHANGING_METHODS",
+    "STRICT_CHROMIUM_ARGS", "WEBRTC_DISABLE_INIT_SCRIPT", "WINDOWS_ISOLATION_LIMITATION",
+    "BrowserEgressPolicy", "EgressAuditEvent", "EgressDecision", "LoopbackValidatingProxy",
+    "build_windows_firewall_guidance", "prepare_browser_mutation_approval",
 ]
 
 
@@ -64,7 +72,13 @@ class BrowserEgressPolicy:
     def __init__(
         self,
         *,
-        approved_method_rules: tuple[ApprovedMethodRule, ...] = (),
+        approval_broker: ApprovalBroker | None = None,
+        proxy: LoopbackValidatingProxy | None = None,
+        session_id: str = DEFAULT_BROWSER_SESSION_ID,
+        auth_context: str = "",
+        cookie_header: str = "",
+        disable_webrtc: bool = True,
+        strict_firewall: bool = False,
         max_redirects: int = 4,
         max_response_bytes: int = 2 * 1024 * 1024,
         allow_downloads: bool = False,
@@ -74,7 +88,13 @@ class BrowserEgressPolicy:
         ssl_wrapper: SSLWrapper = default_ssl_wrapper,
         sender: TransportSender | None = None,
     ) -> None:
-        self.approved_method_rules = approved_method_rules
+        self.approval_broker = approval_broker
+        self.proxy = proxy
+        self.session_id = session_id
+        self.auth_context = auth_context
+        self.cookie_header = cookie_header
+        self.disable_webrtc = disable_webrtc
+        self.strict_firewall = strict_firewall
         self.max_redirects = max_redirects
         self.max_response_bytes = max_response_bytes
         self.allow_downloads = allow_downloads
@@ -83,18 +103,24 @@ class BrowserEgressPolicy:
         self.socket_factory = socket_factory
         self.ssl_wrapper = ssl_wrapper
         self.sender = sender
+        self._mutation_gate = MutationApprovalGate(approval_broker)
         self.audit_log: list[EgressAuditEvent] = []
 
+    def authorize_mutation(self, approval_id: str) -> None:
+        """Register an out-of-band ``approval_id`` for one-time atomic verification on use."""
+        self._mutation_gate.authorize(approval_id)
+
     def build_launch_options(self, *, headless: bool = True) -> dict[str, Any]:
-        """Return hardened Chromium launch options (no unvalidated DNS or background egress)."""
+        """Return hardened Chromium launch options (proxy-enforced when proxy is active)."""
+        if self.proxy is not None and self.proxy.port > 0:
+            return {"headless": headless, "args": build_proxy_chromium_args(self.proxy.port)}
         return {"headless": headless, "args": list(STRICT_CHROMIUM_ARGS)}
 
     def build_context_options(self) -> dict[str, Any]:
         """Return isolated ephemeral BrowserContext options (no personal profile)."""
         return {
-            "service_workers": "block",
-            "accept_downloads": False,
-            "ignore_https_errors": False,
+            "service_workers": "block", "accept_downloads": False,
+            "ignore_https_errors": False, "permissions": [],
         }
 
     def _record(self, event: EgressAuditEvent, decision: EgressDecision) -> EgressDecision:
@@ -107,15 +133,13 @@ class BrowserEgressPolicy:
             EgressDecision(allowed=False, action="abort", reason=reason),
         )
 
-    def _check_method_allowed(self, method: str, url: str, body_len: int) -> str | None:
-        """Return None if method is permitted, otherwise an abort reason string."""
-        if method in SAFE_AUTONOMOUS_METHODS:
-            return None
-        if any(rule.matches(method, url, body_len) for rule in self.approved_method_rules):
-            return None
-        return (
-            f"HTTP method '{method}' blocked: state-changing methods require explicit L3 "
-            "approval matching target origin, path, and body limit."
+    def _consume_mutation_approval(
+        self, method: str, url: str, post_data: bytes | None, headers: dict[str, str] | None,
+    ) -> str | None:
+        return self._mutation_gate.consume_for_request(
+            method, url, post_data, headers=headers,
+            session_id=self.session_id, auth_context=self.auth_context,
+            cookie_header=self.cookie_header,
         )
 
     def _evaluate_special_scheme(
@@ -126,11 +150,8 @@ class BrowserEgressPolicy:
             return self._record(
                 EgressAuditEvent(url, method, resource_type, "fulfill", "blank_page"),
                 EgressDecision(
-                    allowed=True,
-                    action="fulfill",
-                    reason="Initial about:blank frame.",
-                    status_code=200,
-                    headers={"content-type": "text/html"},
+                    allowed=True, action="fulfill", reason="Initial about:blank frame.",
+                    status_code=200, headers={"content-type": "text/html"},
                 ),
             )
         if scheme == "data":
@@ -156,20 +177,14 @@ class BrowserEgressPolicy:
     ) -> EgressDecision:
         stripped = {"host", "connection", "cookie", "authorization", "content-length"}
         clean_headers = {k: v for k, v in (headers or {}).items() if k.lower() not in stripped}
+        effective_redirects = 0 if method not in SAFE_AUTONOMOUS_METHODS else self.max_redirects
         try:
             resp = fetch_safe_url(
-                url,
-                method=method,
-                request_body=post_data,
-                headers=clean_headers,
+                url, method=method, request_body=post_data, headers=clean_headers,
                 allowed_content_types=BROWSER_ALLOWED_CONTENT_TYPES,
-                max_redirects=self.max_redirects,
-                max_response_bytes=self.max_response_bytes,
-                raise_for_status=False,
-                resolver=self.resolver,
-                sender=self.sender,
-                socket_factory=self.socket_factory,
-                ssl_wrapper=self.ssl_wrapper,
+                max_redirects=effective_redirects, max_response_bytes=self.max_response_bytes,
+                raise_for_status=False, resolver=self.resolver, sender=self.sender,
+                socket_factory=self.socket_factory, ssl_wrapper=self.ssl_wrapper,
             )
         except UltimateMCPError as exc:
             return self._abort(url, method, resource_type, f"{exc.code.value}: {exc.message}")
@@ -216,8 +231,9 @@ class BrowserEgressPolicy:
             )
 
         parsed = urllib.parse.urlsplit(cleaned_url)
-        scheme = parsed.scheme.lower()
-        special = self._evaluate_special_scheme(cleaned_url, scheme, norm_method, norm_type)
+        special = self._evaluate_special_scheme(
+            cleaned_url, parsed.scheme.lower(), norm_method, norm_type
+        )
         if special is not None:
             return special
 
@@ -227,9 +243,12 @@ class BrowserEgressPolicy:
                 cleaned_url, norm_method, norm_type, f"Blocked background host '{host_lower}'."
             )
 
-        method_err = self._check_method_allowed(norm_method, cleaned_url, len(post_data or b""))
-        if method_err is not None:
-            return self._abort(cleaned_url, norm_method, norm_type, method_err)
+        if norm_method not in SAFE_AUTONOMOUS_METHODS:
+            deny_reason = self._consume_mutation_approval(
+                norm_method, cleaned_url, post_data, headers
+            )
+            if deny_reason is not None:
+                return self._abort(cleaned_url, norm_method, norm_type, deny_reason)
 
         return self._forward_via_pinned_transport(
             cleaned_url, norm_method, norm_type, headers, post_data
@@ -261,6 +280,19 @@ class BrowserEgressPolicy:
             return
         await route.abort("blockedbyclient")
 
+    async def handle_playwright_websocket(self, ws_route: Any) -> None:
+        """Async Playwright WebSocketRoute handler; aborts ALL ws:// and wss:// by default."""
+        ws_url = str(getattr(ws_route, "url", ""))
+        self.audit_log.append(
+            EgressAuditEvent(
+                ws_url, "GET", "websocket", "abort", "WebSockets blocked by egress policy."
+            )
+        )
+        await ws_route.close(code=1008, reason="WebSockets blocked by egress policy")
+
     async def attach_to_context(self, context: Any) -> None:
-        """Register the strict wildcard route handler on a Playwright ``BrowserContext``."""
+        """Register WebSocket, wildcard HTTP, and WebRTC hardening before opening pages."""
+        if self.disable_webrtc and hasattr(context, "add_init_script"):
+            await context.add_init_script(WEBRTC_DISABLE_INIT_SCRIPT)
+        await context.route_web_socket("**/*", self.handle_playwright_websocket)
         await context.route("**/*", self.handle_playwright_route)
