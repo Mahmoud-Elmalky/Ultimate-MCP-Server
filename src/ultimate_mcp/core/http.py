@@ -364,22 +364,51 @@ def _raise_for_error_status(raw: RawHTTPResponse, normalized_url: str) -> None:
     )
 
 
+SAFE_AUTONOMOUS_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
+PERMITTED_HTTP_METHODS: frozenset[str] = frozenset(
+    {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}
+)
+DEFAULT_MAX_REQUEST_BYTES = 256 * 1024  # 256 KiB
+
+
+def _origin_key(parsed: urllib.parse.ParseResult) -> tuple[str, str, int]:
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").strip().rstrip(".").lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return (scheme, host, port)
+
+
 def fetch_safe_url(
     url: str,
     *,
+    method: str = "GET",
+    request_body: bytes | None = None,
     headers: dict[str, str] | None = None,
     allowed_ports: frozenset[int] = DEFAULT_ALLOWED_PORTS,
     allowed_content_types: Sequence[str] | None = DEFAULT_ALLOWED_CONTENT_TYPES,
     max_redirects: int = DEFAULT_MAX_REDIRECTS,
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
     read_timeout: float = DEFAULT_READ_TIMEOUT,
+    raise_for_status: bool = True,
     resolver: ResolverFunc = default_dns_resolver,
     sender: TransportSender | None = None,
     socket_factory: SocketFactory = default_socket_factory,
     ssl_wrapper: SSLWrapper = default_ssl_wrapper,
 ) -> SafeHttpResponse:
     """Fetch a public HTTP(S) URL with pinned-IP SSRF, DNS-rebinding, and byte-budget guards."""
+    active_method = method.strip().upper() or "GET"
+    if active_method not in PERMITTED_HTTP_METHODS:
+        raise UltimateMCPError(
+            ErrorCode.INVALID_INPUT,
+            f"Unsupported HTTP method '{active_method}'.",
+        )
+    if request_body is not None and len(request_body) > max_request_bytes:
+        raise UltimateMCPError(
+            ErrorCode.RESOURCE_LIMIT_EXCEEDED,
+            f"Request body ({len(request_body)} bytes) exceeds limit ({max_request_bytes} bytes).",
+        )
     if max_redirects < 0 or max_redirects > 10:
         raise UltimateMCPError(ErrorCode.INVALID_INPUT, "max_redirects must be between 0 and 10.")
     if max_response_bytes <= 0:
@@ -396,6 +425,7 @@ def fetch_safe_url(
     }
 
     current_url = url.strip()
+    active_body = request_body
     redirect_count = 0
     visited_urls: set[str] = set()
 
@@ -428,6 +458,8 @@ def fetch_safe_url(
                 connect_timeout,
                 read_timeout,
                 max_response_bytes,
+                method=active_method,
+                request_body=active_body,
                 pinned_ips=pre_ips,
                 public_ip_checker=is_public_ip_address,
                 socket_factory=socket_factory,
@@ -454,11 +486,27 @@ def fetch_safe_url(
                     ErrorCode.UPSTREAM_INVALID_RESPONSE,
                     f"Redirect response (HTTP {raw.status_code}) missing Location header.",
                 )
-            current_url = urllib.parse.urljoin(normalized_url, location.strip())
+            next_url = urllib.parse.urljoin(normalized_url, location.strip())
+            if raw.status_code in (301, 302, 303) and active_method not in ("GET", "HEAD"):
+                active_method = "GET"
+                active_body = None
+            elif active_body is not None:
+                next_parsed = urllib.parse.urlsplit(next_url)
+                next_origin = (
+                    next_parsed.scheme.lower(),
+                    (next_parsed.hostname or "").strip().rstrip(".").lower(),
+                    next_parsed.port or (443 if next_parsed.scheme.lower() == "https" else 80),
+                )
+                if next_origin != _origin_key(parsed):
+                    raise UltimateMCPError(
+                        ErrorCode.SSRF_BLOCKED,
+                        "Refusing cross-origin redirect of request body on HTTP 307/308.",
+                    )
+            current_url = next_url
             redirect_count += 1
             continue
 
-        if raw.status_code >= 400:
+        if raise_for_status and raw.status_code >= 400:
             _raise_for_error_status(raw, normalized_url)
 
         content_type = _extract_content_type(raw.headers)

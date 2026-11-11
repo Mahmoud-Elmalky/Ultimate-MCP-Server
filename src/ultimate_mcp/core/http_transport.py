@@ -183,12 +183,15 @@ def send_pinned_http_request(
     read_timeout: float,
     max_response_bytes: int,
     *,
+    method: str = "GET",
+    request_body: bytes | None = None,
     pinned_ips: tuple[str, ...],
     public_ip_checker: Callable[[str], bool],
     socket_factory: SocketFactory = default_socket_factory,
     ssl_wrapper: SSLWrapper = default_ssl_wrapper,
 ) -> RawHTTPResponse:
-    """Execute a single non-redirecting HTTP(S) GET pinned to validated IP addresses."""
+    """Execute a single non-redirecting HTTP(S) request pinned to validated IP addresses."""
+    norm_method = method.strip().upper() or "GET"
     if not pinned_ips:
         raise UltimateMCPError(
             ErrorCode.SSRF_BLOCKED,
@@ -239,9 +242,13 @@ def send_pinned_http_request(
             "Connection": "close",
             "Accept-Encoding": "gzip, deflate",
         }
-        conn.request("GET", target_path, headers=req_headers)
+        conn.request(norm_method, target_path, body=request_body, headers=req_headers)
         resp = conn.getresponse()
-        resp_headers, body = _read_bounded_response(resp, max_response_bytes)
+        resp_headers, body = (
+            ({k.lower(): v for k, v in resp.getheaders()}, b"")
+            if norm_method == "HEAD"
+            else _read_bounded_response(resp, max_response_bytes)
+        )
         return RawHTTPResponse(
             status_code=resp.status,
             headers=resp_headers,

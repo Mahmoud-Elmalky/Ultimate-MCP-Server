@@ -4,8 +4,10 @@
 
 ## 1. Current Repository & Git State
 
-- **Last updated:** 2026-11-11T23:52+02:00
-- **Branch:** `feat/v2-phase-2` (preparing final Phase 02 checkpoint commit before creating `feat/v2-phase-3`)
+- **Last updated:** 2026-11-11T23:56+02:00
+- **Branch:** `feat/v2-phase-3` (branched from finalized Phase 02 checkpoint `1a97327` on `feat/v2-phase-2`)
+- **Latest finalized Phase 02 checkpoint commit (`feat/v2-phase-2`):**
+  - `1a97327` (`1a973272e32cc97b477810353465fd2c9b96fab7`) — `fix(phase2): finalize audit hardening and cache expiration`
 - **Prior Phase 02 commits:**
   - `1a9b92b` — `fix(phase2): calibrate evidence labels, harden cache scoping, and specify phase 03 browser security`
   - `ffcca82` — `fix(phase2): harden pinned-IP SSRF transport, evidence calibration, and TTL cache`
@@ -61,7 +63,13 @@ JSON schemas contain dense structural punctuation (`{`, `}`, `:`, `"`, `,`), so 
 3. **Conservative Deterministic Evidence Workflows (`modules/research/evidence_signals.py`, `modules/research/workflows.py`):**
    - Calibrated labels: `"No contradiction detected"`, `"Potential supporting evidence"`, `"Conflicting evidence detected"`, `"Insufficient evidence"`.
 
-## 5. Phase 03 Readiness & First Milestone
+## 5. Phase 03 Progress & Next Milestone
 
-- **Branch target:** Create `feat/v2-phase-3` from the finalized Phase 02 checkpoint commit.
-- **First Slice:** Implement and test the **Browser Security & Network Egress** foundation (`src/ultimate_mcp/modules/browser/egress.py` + `tests/security/test_browser_egress_phase3.py`) following `phases/PHASE-03_BROWSER_DOCUMENTS.md` §A.1 before building the full Playwright toolset.
+- **Active branch:** `feat/v2-phase-3` (branched from `1a97327`; `feat/v2-phase-2` preserved untouched).
+- **LM Studio UI verification:** Remains explicitly `pending` (live `%USERPROFILE%\.lmstudio\mcp.json` untouched).
+- **Slice 3.1 Implemented (Browser Security & Network Egress Prototype):**
+  - `src/ultimate_mcp/modules/browser/policy_types.py` — Hardened Chromium launch flags (`STRICT_CHROMIUM_ARGS` with `--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1` and `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`), blocked resource/host lists, Windows `CLONE_NEWNET` limitation constant (`WINDOWS_ISOLATION_LIMITATION`), `ApprovedMethodRule`, `EgressDecision`, and `EgressAuditEvent`.
+  - `src/ultimate_mcp/modules/browser/egress.py` — `BrowserEgressPolicy` enforcing `context.route("**/*", ...)` with `fulfill`/`abort` ONLY (never `route.continue_()` for external URLs), routing every permitted HTTP(S) navigation, subresource, fetch/XHR, and approved POST through pinned-IP `fetch_safe_url`.
+  - `src/ultimate_mcp/core/http.py` & `src/ultimate_mcp/core/http_transport.py` — Extended `fetch_safe_url` / `send_pinned_http_request` for method-aware (`GET`/`HEAD`/`OPTIONS` autonomous, non-GET strictly caller-approved), hop-validated redirects (301/302/303 downgrade, 307/308 cross-origin body block).
+  - `tests/security/test_browser_egress_phase3.py` — 9 spy-socket + spy-Playwright-route tests verifying private/loopback/metadata blocking across resource types, redirect-hop SSRF blocking, pre-TLS peer-IP mismatch abort with zero HTTP bytes, TLS SNI hostname forwarding, safe POST gating, and disabled downloads.
+- **Scope note (not yet complete):** Full Playwright browser lifecycle/session/DOM/screenshot tools, live Chromium integration fixture tests (when `playwright` extra is installed), and Document Intelligence tools remain for subsequent Phase 03 slices.
