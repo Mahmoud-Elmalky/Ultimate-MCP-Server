@@ -1,0 +1,44 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local state and generated artifacts
+state/
+.cache/
+artifacts/
+downloads/
+logs/
+*.sqlite3
+*.db
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Model/media weights
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
