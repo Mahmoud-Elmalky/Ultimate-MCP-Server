@@ -2,7 +2,7 @@
 
 ## Status
 - Status: `complete` (post-audit verified)
-- Commit/branch (if known): `feat/v2-phase-2` (HEAD `ffcca82` + final calibration working-tree changes ready for user-authorized checkpoint commit)
+- Commit/branch (if known): `feat/v2-phase-2`. Prior Phase 02 commits: `44b77c9`, `ffcca82`, `1a9b92b`. The final checkpoint commit adds the cache expiration fix and these doc corrections.
 - Date: 2026-11-11
 
 ## Summary
@@ -54,33 +54,42 @@
   - `IMPLEMENTATION_ROADMAP.md`
   - `phases/PHASE-03_BROWSER_DOCUMENTS.md`
 
-## Tests and commands actually executed
+## Tests and commands actually executed (final run 2026-11-11T23:48+02:00)
 | Command | Exit/result | Notes |
 |---|---|---|
-| `uv run pytest -p no:cacheprovider --cov=ultimate_mcp --cov-report=term-missing` | 0 | **122 passed** in 11.41s, **87% total coverage** (3,448 stmts, 433 missed) |
+| `uv run pytest -p no:cacheprovider --cov=ultimate_mcp --cov-report=term-missing` | 0 | **125 passed** in 6.83s, **88% total coverage** (3,448 stmts, 431 missed) |
+| `uv run pytest -p no:cacheprovider tests/security/test_http_and_cache_phase2.py -q` | 0 | **56 passed** (HTTP/SSRF/pinned-IP + cache security tests) |
 | `uv run ruff check src tests` | 0 | `All checks passed!` |
 | `uv run mypy` | 0 | `Success: no issues found in 48 source files` (`strict = true`) |
-| `.\.venv-baseline\Scripts\python.exe -m pytest tests/characterization -p no:cacheprovider -q` | 0 | **56 passed** in 7.53s (legacy characterization preserved) |
-| `uv run ultimate-mcp doctor` | 0 | Verified `default` profile (5 tools) and provider health diagnostics |
+| `.\.venv-baseline\Scripts\python.exe -m pytest tests/characterization -p no:cacheprovider -q` | 0 | **56 passed** in 6.00s (legacy characterization preserved) |
+| `uv run ultimate-mcp doctor` | 0 | `default` profile, 5 tools, SQLite FTS5 available |
+
+## Cache expiration semantics (final)
+- An entry is **fresh only while `now < expires_at`** and **expired when `now >= expires_at`** (both in `get()` and in the proactive purge inside `put()`).
+- Stale fallback is returned only when the caller passes `allow_stale=True`, `max_stale_seconds > 0`, and `now - expires_at <= max_stale_seconds`. It is best-effort: any `put()` purges expired entries first.
+- `MARKET_QUOTE` and `EXCHANGE_RATE` are never returned at or after expiry, even with `allow_stale=True`.
+- Tests: `test_cache_expiration_boundary_now_ge_expires_at_is_expired`, `test_financial_cache_never_returned_at_or_after_expiration[market_quote|exchange_rate]`, `test_per_class_ttl_cache_freshness_stale_and_eviction`.
 
 ## Performance & Local Model Context Footprint
-Methodology: Measured compact JSON bytes (`separators=(',', ':')`) from `gw.mcp.list_tools()` alongside two heuristic estimators (neither is an exact BPE tokenizer measurement):
-1. `chars / 4` Heuristic (standard prose approximation).
-2. `Structural Regex Token Proxy` (`len(re.findall(r'[A-Za-z0-9]+|[^A-Za-z0-9\s]', payload))`, a regex-based structural proxy that counts alphanumeric runs and JSON punctuation tokens separately, not an actual model BPE tokenizer).
+Methodology: compact JSON bytes (`separators=(',', ':')`) from `gw.mcp.list_tools()`, re-measured 2026-11-11T23:48+02:00, together with two heuristic estimators. **Neither one is an exact tokenizer measurement:**
+1. `chars / 4` heuristic (a prose approximation).
+2. `Structural Regex Token Proxy` (`len(re.findall(r'[A-Za-z0-9]+|[^A-Za-z0-9\s]', payload))`). It is a regex proxy that counts alphanumeric runs and punctuation separately, not a model BPE tokenizer.
 
-| Profile | Enabled Tools | Compact JSON Bytes | `chars / 4` Heuristic | Structural Regex Token Proxy | Recommended Context Window (Unverified Heuristic) |
+> Correction: the previous revision of this report listed figures for `fact_check`, `research`, and `full` that were not re-measured after the tool-description edits. The table below contains the re-measured values.
+
+| Profile | Enabled Tools | Compact JSON Bytes | `chars / 4` Heuristic | Structural Regex Token Proxy | Recommended Context Window (recommendation, not verified per model) |
 |---|---:|---:|---:|---:|---|
-| `browser` | 1 | 429 B | 107 | 152 | 4k+ (recommendation) |
-| `documents` | 3 | 1,635 B | 408 | 565 | 4k+ (recommendation) |
-| `youtube` | 4 | 2,237 B | 559 | 803 | 4k+ (recommendation) |
-| `default` | 5 | 2,833 B | 708 | 963 | 4k+ (recommendation) |
-| `live_data` | 6 | 3,307 B | 826 | 1,210 | 4k–8k+ (recommendation) |
-| `coding` | 6 | 3,529 B | 882 | 1,230 | 4k–8k+ (recommendation) |
-| `search` | 7 | 3,814 B | 953 | 1,385 | 4k–8k+ (recommendation) |
-| `web_research` | 7 | 3,975 B | 993 | 1,518 | 4k–8k+ (recommendation) |
-| `fact_check` | 7 | 4,568 B | 1,142 | 1,619 | 4k–8k+ (recommendation) |
-| `research` | 23 | 13,847 B | 3,461 | 5,092 | 16k+ (recommendation) |
-| `full` | 30 | 17,339 B | 4,334 | 6,360 | 32k+ (opt-in recommendation) |
+| `browser` | 1 | 429 B | 107 | 152 | 4k+ |
+| `documents` | 3 | 1,635 B | 408 | 565 | 4k+ |
+| `youtube` | 4 | 2,237 B | 559 | 803 | 4k+ |
+| `default` | 5 | 2,833 B | 708 | 963 | 4k+ |
+| `live_data` | 6 | 3,307 B | 826 | 1,210 | 4k–8k+ |
+| `coding` | 6 | 3,529 B | 882 | 1,230 | 4k–8k+ |
+| `search` | 7 | 3,814 B | 953 | 1,385 | 4k–8k+ |
+| `web_research` | 7 | 3,975 B | 993 | 1,518 | 4k–8k+ |
+| `fact_check` | 7 | 4,607 B | 1,151 | 1,622 | 4k–8k+ |
+| `research` | 23 | 13,886 B | 3,471 | 5,095 | 16k+ |
+| `full` | 30 | 17,378 B | 4,344 | 6,363 | 32k+ (opt-in) |
 
 ## Acceptance criteria
 | Criterion | Result | Evidence |
@@ -89,10 +98,16 @@ Methodology: Measured compact JSON bytes (`separators=(',', ':')`) from `gw.mcp.
 | Missing API keys disable only affected providers | Pass | `TavilySearchProvider(api_key=None)` and `DefaultYouTubeProvider(api_key=None)` tested; `youtube_transcript` and `DuckDuckGoSearchProvider` work without keys |
 | Results identify provider and source/freshness metadata | Pass | Every tool attaches `Provenance(provider=..., retrieved_at=..., source_url/id=..., freshness_note=...)` |
 | Search fallback and partial outcomes are visible rather than hidden | Pass | `web_search_service`, `search_news_service`, and `multi_search_service` return `ResultStatus.PARTIAL` with explicit warnings when a provider fails |
-| URL fetching passes all SSRF/pinned-IP/redirect/size tests | Pass | 53/53 tests in `tests/security/test_http_and_cache_phase2.py`, proving zero TLS/HTTP bytes are transmitted when peer IP is private or unapproved |
-| Evidence workflows use conservative calibrated labels and detect conflicts/context divergence | Pass | Verified in `test_deterministic_evidence_workflows` (`No contradiction detected`, `Potential supporting evidence`, `Conflicting evidence detected`, `Insufficient evidence`) |
-| All current data claims are timestamped and caveated correctly | Pass | `get_weather`, `get_market_price`, and `get_exchange_rate` include observation/quote timestamps, units/currency, delayed-feed caveats, and never serve stale financial quotes |
+| URL fetching passes all SSRF/pinned-IP/redirect/size tests | Pass | 56/56 tests in `tests/security/test_http_and_cache_phase2.py`; socket-spy tests prove zero TLS/HTTP bytes when the peer IP is private or unapproved |
+| Evidence workflows use conservative calibrated labels and detect conflicts/context divergence | Pass | `test_deterministic_evidence_workflows` (`No contradiction detected`, `Potential supporting evidence`, `Conflicting evidence detected`, `Insufficient evidence`) |
+| All current data claims are timestamped and caveated correctly | Pass | Weather/market/FX outputs carry timestamps and caveats; financial cache entries are never returned at or after expiry |
+
+## Known limitations
+- LM Studio desktop UI verification of `Ultimate-MCP-v2` is **pending** manual verification; only protocol-level stdio tests (`tests/integration/test_v2_stdio_server.py`) have been executed.
+- Evidence workflows are deterministic lexical/regex heuristics and are not semantic verification.
+- The cache is in-process only. Sensitive-value detection is regex-based.
+- The pinned transport connects to `pre_ips[0]` only, with no multi-IP failover.
 
 ## Recommendation
-- Proceed to next phase? `yes` (pending user review and commit authorization)
-- Reason: All Phase 02 acceptance criteria, pinned-IP DNS-rebinding defenses, conservatively calibrated evidence workflows, thread-safe TTL cache limits, Phase 03 browser security architecture specification, offline tests (122 passing, 87% coverage), strict mypy, ruff, and 56 legacy characterization tests pass.
+- Proceed to next phase? `yes`
+- Reason: all Phase 02 acceptance criteria are evidenced by the final run above: 125 V2 tests, 88% coverage, 56 HTTP/cache security tests, 56 legacy tests, ruff, strict mypy, and doctor.

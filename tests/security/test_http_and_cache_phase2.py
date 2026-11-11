@@ -529,10 +529,16 @@ def test_per_class_ttl_cache_freshness_stale_and_eviction() -> None:
     assert hit.age_seconds == 30.0
     assert "Cached result from wttr.in" in hit.freshness_note()
 
+    fake_now = 1059.999
+    before_boundary = cache.get(key_w)
+    assert before_boundary is not None
+    assert before_boundary.is_stale is False
+
+    # Exactly at expires_at (1060.0): expired; only a stale lookup may return it
     fake_now = 1060.0
-    boundary_hit = cache.get(key_w)
-    assert boundary_hit is not None
-    assert boundary_hit.is_stale is False
+    boundary_stale = cache.get(key_w, allow_stale=True, max_stale_seconds=30.0)
+    assert boundary_stale is not None
+    assert boundary_stale.is_stale is True
 
     fake_now = 1075.0
     stale_hit = cache.get(key_w, allow_stale=True, max_stale_seconds=30.0)
@@ -542,6 +548,78 @@ def test_per_class_ttl_cache_freshness_stale_and_eviction() -> None:
 
     assert cache.get(key_w, allow_stale=False) is None
     assert len(cache) == 0
+
+
+def test_cache_expiration_boundary_now_ge_expires_at_is_expired() -> None:
+    """Expiry semantics: fresh iff now < expires_at; expired iff now >= expires_at."""
+    fake_now = 0.0
+    cache: PerClassTTLCache[str] = PerClassTTLCache(
+        ttl_overrides={CacheDataClass.WEATHER: 100.0},
+        clock=lambda: fake_now,
+    )
+
+    def reset(key: str) -> None:
+        nonlocal fake_now
+        fake_now = 0.0
+        cache.put(key, CacheDataClass.WEATHER, "wttr", "v")
+
+    # Just before expiration: fresh
+    reset("w")
+    fake_now = 99.999
+    hit = cache.get("w")
+    assert hit is not None and hit.is_stale is False
+
+    # Exactly at expiration: expired (no stale requested -> None, entry evicted)
+    reset("w")
+    fake_now = 100.0
+    assert cache.get("w") is None
+    assert len(cache) == 0
+
+    # After expiration: expired
+    reset("w")
+    fake_now = 150.0
+    assert cache.get("w") is None
+
+    # Stale fallback only when explicitly permitted and within the configured limit
+    reset("w")
+    fake_now = 100.0 + 20.0
+    assert cache.get("w", allow_stale=True, max_stale_seconds=19.0) is None  # beyond limit
+    reset("w")
+    fake_now = 120.0
+    within = cache.get("w", allow_stale=True, max_stale_seconds=20.0)  # at limit
+    assert within is not None and within.is_stale is True
+    reset("w")
+    fake_now = 110.0
+    assert cache.get("w", allow_stale=True, max_stale_seconds=0.0) is None  # zero window
+    reset("w")
+    fake_now = 110.0
+    assert cache.get("w") is None  # stale never served implicitly
+
+    # put() purges entries at exactly expires_at
+    reset("w")
+    fake_now = 100.0
+    cache.put("other", CacheDataClass.WEATHER, "wttr", "x")
+    assert len(cache) == 1
+
+
+@pytest.mark.parametrize("data_class", [CacheDataClass.MARKET_QUOTE, CacheDataClass.EXCHANGE_RATE])
+def test_financial_cache_never_returned_at_or_after_expiration(
+    data_class: CacheDataClass,
+) -> None:
+    fake_now = 0.0
+    cache: PerClassTTLCache[float] = PerClassTTLCache(
+        ttl_overrides={data_class: 60.0},
+        clock=lambda: fake_now,
+    )
+    cache.put("q", data_class, "yfinance", 1.0)
+    fake_now = 59.999
+    assert cache.get("q") is not None
+    # At, just after, and long after expiry: never returned, even with stale explicitly allowed
+    for probe in (60.0, 60.001, 3600.0):
+        fake_now = 0.0
+        cache.put("q", data_class, "yfinance", 1.0)
+        fake_now = probe
+        assert cache.get("q", allow_stale=True, max_stale_seconds=1e9) is None
 
 
 def test_ttl_cache_prohibits_stale_market_data_and_sensitive_keys_or_values() -> None:

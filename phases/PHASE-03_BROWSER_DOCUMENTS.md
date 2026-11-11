@@ -30,8 +30,11 @@ Phase 01 core/security/approvals and Phase 02 URL/provenance primitives accepted
    - Every navigation (`browser_open`, link clicks, `window.location` changes, meta-refresh, and HTTP `301/302/303/307/308` redirects) must be validated hop-by-hop against `validate_and_resolve_url` (`http`/`https` only, allowed ports, public IP validation across all A/AAAA records).
 2. **Subresource Requests (`image`, `script`, `stylesheet`, `font`, `media`, `iframe`/`frame`):**
    - `context.route("**/*", ...)` must intercept **all** resource types, not only top-level `document` requests. Disallowed schemes (`file://`, `ftp://`, `ws://`, `wss://`, `chrome://`, `view-source:`) and private/internal hosts are aborted before transmission. Subframes (`frame` / `iframe`) are subject to the exact same origin and IP policy as main frames.
-3. **JavaScript `fetch` / `XMLHttpRequest` (`xhr`, `fetch`, `eventsource`, `ping`):**
-   - All asynchronous in-page requests (`fetch`, `xhr`, `eventsource`, `beacon`/`ping`) are intercepted and validated through the same pinned-IP egress policy; `ping`/`beacon` requests are aborted by default.
+3. **JavaScript `fetch` / `XMLHttpRequest` (`xhr`, `fetch`, `eventsource`, `ping`) & Safe Methods (`GET`, `HEAD`, `POST`, etc.):**
+   - All asynchronous in-page requests (`fetch`, `xhr`, `eventsource`, `beacon`/`ping`) are intercepted and routed through the validated pinned-IP egress transport (`fetch_safe_url` / validating proxy); `ping`/`beacon` requests are aborted by default.
+   - **Method policy:** Only `GET`, `HEAD`, and policy-checked `OPTIONS` are permitted autonomously (`L0`/`L1`). State-changing methods (`POST`, `PUT`, `PATCH`, `DELETE`) are blocked by default unless explicitly permitted:
+     - **Non-side-effecting read-only `POST`** (or form search/query explicitly authorized) still passes the exact same `validate_and_resolve_url` -> `pinned_ip` -> `verify_connected_peer_ip` -> hop-by-hop redirect guard, with bounded request body size (`max_request_bytes`), safe `Content-Type` headers, and no automatic cross-origin credential forwarding.
+     - **State-changing external `POST`/form submissions** (login, purchase, upload, external write) require explicit out-of-band `L3` approval bound to exact target origin, method, and payload/selector digest, and are still subject to full SSRF/DNS-rebinding validation (no method may bypass the network policy).
 4. **WebSockets (`ws://`, `wss://`):**
    - Blocked by default in `context.route` (`resource_type == "websocket" -> route.abort("accessdenied")`) because long-lived WebSocket frames bypass HTTP response size limits and standard route fulfillment.
 5. **Service Workers and Browser Background Requests:**

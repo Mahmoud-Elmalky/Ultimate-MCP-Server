@@ -6,7 +6,8 @@ Follows ``phases/PHASE-02_RESEARCH_UTILITIES.md`` §F:
   explicit policy (`allow_sensitive_policy=True`) is supplied.
 - Rejects un-isolated user-specific identifiers (`user_id`, `account_id`, `tenant_id`, `email`)
   in generic `params` unless explicitly scoped via `user_scope`.
-- TTL and maximum entry counts are enforced both globally and per data class.
+- TTL and maximum entry counts are enforced both globally and per data class. An entry is
+  fresh only while ``now < expires_at``; it is expired when ``now >= expires_at``.
 - Expired entries are purged proactively before capacity LRU eviction.
 - Thread-safe via ``threading.RLock`` for concurrent ``asyncio.to_thread`` worker execution.
 - Financial/market data classes (``MARKET_QUOTE``, ``EXCHANGE_RATE``) are prohibited from
@@ -261,8 +262,12 @@ class PerClassTTLCache(Generic[T]):
         return self._ttls.get(data_class, 300.0)
 
     def _purge_expired_locked(self, now: float) -> int:
-        """Remove all entries whose ``expires_at < now`` while holding ``self._lock``."""
-        expired_keys = [k for k, entry in self._store.items() if now > entry.expires_at]
+        """Remove all entries with ``now >= expires_at`` while holding ``self._lock``.
+
+        Note: this also drops entries that would otherwise be eligible for an explicitly
+        requested stale fallback; stale fallback is best-effort, never guaranteed.
+        """
+        expired_keys = [k for k, entry in self._store.items() if now >= entry.expires_at]
         for k in expired_keys:
             del self._store[k]
         return len(expired_keys)
@@ -328,7 +333,7 @@ class PerClassTTLCache(Generic[T]):
             age = max(0.0, now - entry.created_at)
             ttl = entry.expires_at - entry.created_at
 
-            if now <= entry.expires_at:
+            if now < entry.expires_at:
                 self._store.move_to_end(key)
                 return CacheLookup(
                     value=entry.value,
