@@ -335,7 +335,7 @@ def test_webpage_extraction_links_tables_crawler_and_rss() -> None:
 
 
 def test_deterministic_evidence_workflows() -> None:
-    # 1. Sources agree on shared topic with consistent signals
+    # 1. No contradiction detected on shared topic with consistent signals
     comp = compare_sources_service(
         [
             {
@@ -353,12 +353,12 @@ def test_deterministic_evidence_workflows() -> None:
         ]
     )
     assert comp.status == ResultStatus.SUCCESS
-    assert comp.data["comparison_status"] == "Sources agree"
+    assert comp.data["comparison_status"] == "No contradiction detected"
     assert comp.data["conflicts_detected"] == []
     assert "python" in comp.data["shared_terms"]
     assert "asyncio" in comp.data["shared_terms"]
 
-    # 2. Sources disagree due to negation despite high lexical overlap
+    # 2. Negation conflict despite high lexical overlap
     comp_neg = compare_sources_service(
         [
             {
@@ -375,30 +375,72 @@ def test_deterministic_evidence_workflows() -> None:
             },
         ]
     )
-    assert comp_neg.data["comparison_status"] == "Sources disagree"
+    assert comp_neg.data["comparison_status"] == "Conflicting evidence detected"
     assert len(comp_neg.data["conflicts_detected"]) == 1
 
-    # 3. Sources disagree due to conflicting numeric values and contradictory years
+    # 3. Contradictory numbers, years, and time periods (Q1 vs Q4)
     comp_num = compare_sources_service(
         [
             {
                 "id": "s1",
                 "title": "Report 1",
-                "content": "Project Aurora launched in 2022 with 15% latency reduction.",
+                "content": "Project Aurora launched in Q1 2022 with 15% latency reduction.",
             },
             {
                 "id": "s2",
                 "title": "Report 2",
-                "content": "Project Aurora launched in 2024 with 40% latency reduction.",
+                "content": "Project Aurora launched in Q4 2024 with 40% latency reduction.",
             },
         ]
     )
-    assert comp_num.data["comparison_status"] == "Sources disagree"
+    assert comp_num.data["comparison_status"] == "Conflicting evidence detected"
     reasons = comp_num.data["conflicts_detected"][0]["conflict_reasons"]
     assert any("contradictory_years" in r for r in reasons)
+    assert any("different_time_periods" in r for r in reasons)
     assert any("conflicting_numeric_values" in r for r in reasons)
 
-    # 4. Insufficient evidence when sources share < 2 topical terms
+    # 4. Similar wording with different meanings (role inversion & causal vs correlational)
+    comp_meaning = compare_sources_service(
+        [
+            {
+                "id": "s1",
+                "title": "Study A",
+                "content": "InhibitorX blocked KinaseY activity and proves clinical remission.",
+            },
+            {
+                "id": "s2",
+                "title": "Study B",
+                "content": (
+                    "KinaseY blocked InhibitorX activity and is correlated with remission."
+                ),
+            },
+        ]
+    )
+    assert comp_meaning.data["comparison_status"] == "Conflicting evidence detected"
+    meaning_reasons = comp_meaning.data["conflicts_detected"][0]["conflict_reasons"]
+    assert any("semantic_role_inversion" in r for r in meaning_reasons)
+    assert any("causal_vs_correlational_meaning_mismatch" in r for r in meaning_reasons)
+
+    # 5. Same topic but different populations/contexts (adults vs children; mice vs humans)
+    comp_pop = compare_sources_service(
+        [
+            {
+                "id": "s1",
+                "title": "Adult Trial",
+                "content": "PeptideZ dosage reduced blood pressure by 18% in adults.",
+            },
+            {
+                "id": "s2",
+                "title": "Pediatric Trial",
+                "content": "PeptideZ dosage reduced blood pressure by 6% in children.",
+            },
+        ]
+    )
+    assert comp_pop.data["comparison_status"] == "Insufficient evidence"
+    assert len(comp_pop.data["context_divergences"]) == 1
+    assert "age_cohort" in comp_pop.data["context_divergences"][0]["context_differences"][0]
+
+    # 6. Missing / unrelated evidence (< 2 shared topical terms)
     comp_insuff = compare_sources_service(
         [
             {"id": "s1", "title": "Cooking", "content": "Baking sourdough bread requires flour."},
@@ -443,7 +485,7 @@ def test_deterministic_evidence_workflows() -> None:
         "Python 3.12 improves asyncio performance",
         providers=[FakeProvider()],
     )
-    assert ver.data["verification_status"] == "Supporting evidence found"
+    assert ver.data["verification_status"] == "Potential supporting evidence"
     assert ver.data["evidence_strength"] == "multiple_independent_matches"
     assert ver.data["independent_domain_count"] == 2
 
@@ -479,9 +521,41 @@ def test_deterministic_evidence_workflows() -> None:
         "Python 3.12 improves asyncio performance by 80% in 2025",
         providers=[ConflictingProvider()],
     )
-    assert ver_conflict.data["verification_status"] == "Conflicting evidence found"
+    assert ver_conflict.data["verification_status"] == "Conflicting evidence detected"
     assert ver_conflict.data["evidence_strength"] == "conflicting_evidence"
     assert ver_conflict.data["conflicting_source_count"] == 1
+
+    # Different population/context in verify_claim (mice study vs humans claim) -> Insufficient
+    class MouseStudyProvider:
+        name = "mock_mouse"
+
+        def health(self) -> Any:
+            return None
+
+        def search(
+            self,
+            query: str,
+            *,
+            max_results: int = 5,
+            search_type: str = "general",
+        ) -> list[SearchResultItem]:
+            return [
+                SearchResultItem(
+                    title="CompoundZ longevity trial in mice",
+                    url="https://bio.example.org/mice",
+                    snippet="CompoundZ treatment extended median lifespan by 30% in mice.",
+                    provider="mock_mouse",
+                    rank=1,
+                    retrieved_at="2026-11-11T19:00:00+00:00",
+                )
+            ]
+
+    ver_pop = verify_claim_service(
+        "CompoundZ treatment extended median lifespan by 30% in humans",
+        providers=[MouseStudyProvider()],
+    )
+    assert ver_pop.data["verification_status"] == "Insufficient evidence"
+    assert ver_pop.data["context_mismatch_source_count"] == 1
 
     # Insufficient evidence when results do not overlap the claim
     ver_insuff = verify_claim_service(

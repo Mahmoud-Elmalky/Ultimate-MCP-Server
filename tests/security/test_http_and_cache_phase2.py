@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import socket
+import ssl
 import threading
 from typing import Any
 
@@ -22,6 +23,7 @@ from ultimate_mcp.core.http import (
     validate_and_resolve_url,
 )
 from ultimate_mcp.core.http_transport import (
+    default_ssl_wrapper,
     normalize_socket_ip,
     send_pinned_http_request,
 )
@@ -147,9 +149,10 @@ def test_validate_and_resolve_url_blocks_mixed_dns_records() -> None:
 
 
 def test_pinned_connection_never_transmits_http_when_peer_is_private_or_unapproved() -> None:
-    """CRITICAL: Prove zero HTTP bytes are transmitted if socket peer IP is private/rebound."""
+    """CRITICAL: Prove peer-IP check happens BEFORE TLS handshake and BEFORE HTTP transmission."""
     created_sockets: list[FakeSocket] = []
     connected_targets: list[tuple[str, int]] = []
+    tls_handshakes: list[str] = []
 
     def rebonded_socket_factory(address: tuple[str, int], timeout: float) -> Any:
         connected_targets.append(address)
@@ -158,36 +161,44 @@ def test_pinned_connection_never_transmits_http_when_peer_is_private_or_unapprov
         created_sockets.append(sock)
         return sock
 
+    def spy_ssl_wrapper(sock: Any, server_hostname: str) -> Any:
+        tls_handshakes.append(server_hostname)
+        return sock
+
     with pytest.raises(UltimateMCPError) as exc_info:
         fetch_safe_url(
-            "http://rebind.attacker.example/steal",
+            "https://rebind.attacker.example/steal",
             resolver=lambda h, p: ["93.184.216.34"],
             socket_factory=rebonded_socket_factory,
+            ssl_wrapper=spy_ssl_wrapper,
         )
 
     assert exc_info.value.code == ErrorCode.SSRF_BLOCKED
     # Socket was dialed using the pinned public IP (not hostname)
-    assert connected_targets == [("93.184.216.34", 80)]
+    assert connected_targets == [("93.184.216.34", 443)]
     assert len(created_sockets) == 1
-    # Socket was closed immediately and ZERO HTTP request bytes were ever sent!
+    # Peer IP check failed BEFORE TLS handshake and BEFORE any HTTP request bytes were sent!
+    assert tls_handshakes == []
     assert created_sockets[0].closed is True
     assert created_sockets[0].sent_Payloads == []
 
-    # Also test when peer IP is public but NOT in the validated pre_ips set
+    # Also test when peer IP is public (1.1.1.1) but NOT in the validated pre_ips set
     unapproved_sockets: list[FakeSocket] = []
 
     def unapproved_public_socket_factory(address: tuple[str, int], timeout: float) -> Any:
-        sock = FakeSocket(peer_ip="198.51.100.99", peer_port=address[1])
+        sock = FakeSocket(peer_ip="1.1.1.1", peer_port=address[1])
         unapproved_sockets.append(sock)
         return sock
 
     with pytest.raises(UltimateMCPError) as exc_unapproved:
         fetch_safe_url(
-            "http://rebind.attacker.example/steal",
+            "https://rebind.attacker.example/steal",
             resolver=lambda h, p: ["93.184.216.34"],
             socket_factory=unapproved_public_socket_factory,
+            ssl_wrapper=spy_ssl_wrapper,
         )
     assert exc_unapproved.value.code == ErrorCode.SSRF_BLOCKED
+    assert tls_handshakes == []
     assert unapproved_sockets[0].closed is True
     assert unapproved_sockets[0].sent_Payloads == []
 
@@ -196,8 +207,6 @@ def test_pinned_connection_eliminates_independent_client_dns_lookup_and_preserve
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Prove no second DNS lookup occurs during socket connect, and Host/SNI use original host."""
-    # Even if system socket.getaddrinfo would return 127.0.0.1 if called by an HTTP client,
-    # our pinned socket transport connects directly to pre_ips[0] ("93.184.216.34").
     monkeypatch.setattr(
         socket,
         "getaddrinfo",
@@ -231,6 +240,88 @@ def test_pinned_connection_eliminates_independent_client_dns_lookup_and_preserve
     assert "GET /secure-page?q=1 HTTP/1.1" in transmitted
     assert "Host: example.com\r\n" in transmitted
     assert "Connection: close\r\n" in transmitted
+
+    # Also verify default_ssl_wrapper enforces CERT_REQUIRED, check_hostname=True, and SNI
+    wrapped_calls: list[tuple[Any, str, bool, Any]] = []
+
+    class DummySSLContext:
+        def __init__(self) -> None:
+            self.check_hostname = False
+            self.verify_mode = ssl.CERT_NONE
+
+        def wrap_socket(self, sock: Any, *, server_hostname: str) -> Any:
+            wrapped_calls.append(
+                (sock, server_hostname, self.check_hostname, self.verify_mode)
+            )
+            return sock
+
+    monkeypatch.setattr(ssl, "create_default_context", DummySSLContext)
+    dummy_sock = FakeSocket(peer_ip="93.184.216.34", peer_port=443)
+    default_ssl_wrapper(dummy_sock, "secure.example.org")  # type: ignore[arg-type]
+    assert wrapped_calls == [
+        (dummy_sock, "secure.example.org", True, ssl.CERT_REQUIRED)
+    ]
+
+
+def test_all_redirects_use_new_validated_and_pinned_socket_per_hop() -> None:
+    """Prove every redirect hop resolves DNS, pins the new IP, and opens a fresh socket."""
+    dialed: list[tuple[str, int]] = []
+    sockets_by_hop: list[FakeSocket] = []
+    sni_by_hop: list[str] = []
+
+    def hop_resolver(host: str, port: int) -> list[str]:
+        if host == "hop1.example.com":
+            return ["93.184.216.34"]
+        if host == "hop2.example.org":
+            return ["1.1.1.1"]
+        raise AssertionError(f"Unexpected host lookup: {host}")
+
+    hop1_bytes = (
+        b"HTTP/1.1 302 Found\r\n"
+        b"Location: https://hop2.example.org/final-dest\r\n"
+        b"Content-Length: 0\r\n\r\n"
+    )
+    hop2_bytes = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"Content-Length: 12\r\n\r\n"
+        b"Hop 2 Result"
+    )
+
+    def multi_hop_socket_factory(addr: tuple[str, int], timeout: float) -> Any:
+        dialed.append(addr)
+        payload = hop1_bytes if addr[0] == "93.184.216.34" else hop2_bytes
+        sock = FakeSocket(peer_ip=addr[0], peer_port=addr[1], response_bytes=payload)
+        sockets_by_hop.append(sock)
+        return sock
+
+    def spy_ssl(sock: Any, server_hostname: str) -> Any:
+        sni_by_hop.append(server_hostname)
+        sock.sni_hostname = server_hostname
+        return sock
+
+    resp = fetch_safe_url(
+        "https://hop1.example.com/start",
+        resolver=hop_resolver,
+        socket_factory=multi_hop_socket_factory,
+        ssl_wrapper=spy_ssl,
+    )
+    assert resp.status_code == 200
+    assert resp.final_url == "https://hop2.example.org/final-dest"
+    assert resp.redirect_count == 1
+    assert resp.text == "Hop 2 Result"
+    assert dialed == [("93.184.216.34", 443), ("1.1.1.1", 443)]
+    assert sni_by_hop == ["hop1.example.com", "hop2.example.org"]
+    assert len(sockets_by_hop) == 2
+    assert sockets_by_hop[0] is not sockets_by_hop[1]
+    assert sockets_by_hop[0].closed is True
+    assert sockets_by_hop[1].closed is True
+    req1 = b"".join(sockets_by_hop[0].sent_Payloads).decode("latin-1")
+    req2 = b"".join(sockets_by_hop[1].sent_Payloads).decode("latin-1")
+    assert "Host: hop1.example.com\r\n" in req1
+    assert "Connection: close\r\n" in req1
+    assert "Host: hop2.example.org\r\n" in req2
+    assert "Connection: close\r\n" in req2
 
 
 def test_pinned_ipv6_connection_and_gzip_decompression() -> None:
@@ -288,7 +379,6 @@ def test_proxy_environment_variables_are_ignored(monkeypatch: pytest.MonkeyPatch
 
 def test_dns_changes_between_requests_and_post_request_rebinding() -> None:
     """Verify DNS changes between request 1 and request 2 or during request are blocked."""
-    # Case A: DNS flips from public on pre-check to 127.0.0.1 on post-check
     calls = 0
 
     def flipping_resolver(host: str, port: int) -> list[str]:
@@ -304,7 +394,6 @@ def test_dns_changes_between_requests_and_post_request_rebinding() -> None:
         )
     assert exc_post.value.code == ErrorCode.SSRF_BLOCKED
 
-    # Case B: Request 1 succeeds with public IP, then DNS changes to 10.0.0.1 before Request 2
     current_ips = ["93.184.216.34"]
     dialed: list[tuple[str, int]] = []
 
@@ -332,7 +421,6 @@ def test_dns_changes_between_requests_and_post_request_rebinding() -> None:
             socket_factory=tracking_factory,
         )
     assert exc_req2.value.code == ErrorCode.SSRF_BLOCKED
-    # Confirm no second socket was ever opened!
     assert len(dialed) == 1
 
 
@@ -363,7 +451,6 @@ def test_fetch_safe_url_blocks_redirect_to_private_ip_before_connecting() -> Non
             socket_factory=socket_factory,
         )
     assert exc_info.value.code == ErrorCode.SSRF_BLOCKED
-    # Hop 1 connected to 93.184.216.34, Hop 2 was blocked before any socket connection!
     assert dialed == [("93.184.216.34", 80)]
 
 
@@ -442,13 +529,11 @@ def test_per_class_ttl_cache_freshness_stale_and_eviction() -> None:
     assert hit.age_seconds == 30.0
     assert "Cached result from wttr.in" in hit.freshness_note()
 
-    # Exact expiration boundary (now == expires_at is still fresh)
     fake_now = 1060.0
     boundary_hit = cache.get(key_w)
     assert boundary_hit is not None
     assert boundary_hit.is_stale is False
 
-    # Past TTL (now > expires_at) -> weather allows bounded stale when explicitly requested
     fake_now = 1075.0
     stale_hit = cache.get(key_w, allow_stale=True, max_stale_seconds=30.0)
     assert stale_hit is not None
@@ -459,8 +544,8 @@ def test_per_class_ttl_cache_freshness_stale_and_eviction() -> None:
     assert len(cache) == 0
 
 
-def test_ttl_cache_prohibits_stale_market_data_and_sensitive_keys() -> None:
-    """Ensure MARKET_QUOTE and EXCHANGE_RATE never return stale data and sensitive keys fail."""
+def test_ttl_cache_prohibits_stale_market_data_and_sensitive_keys_or_values() -> None:
+    """Ensure MARKET_QUOTE/EXCHANGE_RATE never return stale data and sensitive keys/values fail."""
     fake_now = 5000.0
     cache: PerClassTTLCache[dict[str, Any]] = PerClassTTLCache(
         ttl_overrides={
@@ -474,7 +559,6 @@ def test_ttl_cache_prohibits_stale_market_data_and_sensitive_keys() -> None:
     cache.put(mk_key, CacheDataClass.MARKET_QUOTE, "yfinance", {"price": 225.0})
     cache.put(fx_key, CacheDataClass.EXCHANGE_RATE, "yfinance", {"rate": 49.2})
 
-    # Advance past TTL
     fake_now = 5065.0
     # Even with allow_stale=True, financial data MUST NOT be served stale
     assert cache.get(mk_key, allow_stale=True, max_stale_seconds=3600.0) is None
@@ -490,16 +574,77 @@ def test_ttl_cache_prohibits_stale_market_data_and_sensitive_keys() -> None:
                 params={sensitive_param: "secret-val"},
             )
 
+    # Sensitive credential-like values in safe-looking keys or queries must also be rejected
+    for secret_val in (
+        "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6",
+        "tvly-1234567890abcdef",
+        "sk-proj-1234567890abcdef",
+        "AIzaSyA1234567890abcdef12345",
+        "ghp_1234567890abcdef1234567890",
+    ):
+        with pytest.raises(ValueError, match="credential-like"):
+            build_cache_key(
+                CacheDataClass.WEB_SEARCH,
+                "tavily",
+                "query",
+                params={"filter": secret_val},
+            )
+    with pytest.raises(ValueError, match="credential-like"):
+        build_cache_key(
+            CacheDataClass.WEB_SEARCH,
+            "tavily",
+            "search api_key=my_secret_value_12345",
+        )
 
-def test_ttl_cache_per_class_limits_key_isolation_and_thread_safety() -> None:
-    """Verify per-class capacity limits, provider/query key isolation, and thread safety."""
-    # Provider & query key isolation
-    k_tavily = build_cache_key(CacheDataClass.WEB_SEARCH, "tavily", "python")
-    k_ddg = build_cache_key(CacheDataClass.WEB_SEARCH, "duckduckgo", "python")
-    k_news = build_cache_key(CacheDataClass.NEWS_SEARCH, "tavily", "python")
-    assert len({k_tavily, k_ddg, k_news}) == 3
 
+def test_ttl_cache_per_class_limits_lru_key_isolation_user_scope_and_thread_safety() -> None:
+    """Verify per-class/global LRU capacity, provider/query/locale/user isolation, & threads."""
+    k_tavily = build_cache_key(CacheDataClass.WEB_SEARCH, "tavily", "python", locale="en")
+    k_ddg = build_cache_key(CacheDataClass.WEB_SEARCH, "duckduckgo", "python", locale="en")
+    k_ar = build_cache_key(CacheDataClass.WEB_SEARCH, "tavily", "python", locale="ar")
+    k_news = build_cache_key(CacheDataClass.NEWS_SEARCH, "tavily", "python", locale="en")
+    k_user_a = build_cache_key(
+        CacheDataClass.WEB_SEARCH,
+        "tavily",
+        "python",
+        user_scope="tenant_a",
+        params={"user_id": "u1"},
+    )
+    k_user_b = build_cache_key(
+        CacheDataClass.WEB_SEARCH,
+        "tavily",
+        "python",
+        user_scope="tenant_b",
+        params={"user_id": "u1"},
+    )
+    assert len({k_tavily, k_ddg, k_ar, k_news, k_user_a, k_user_b}) == 6
+
+    # Un-isolated user_id in public scope is rejected
+    with pytest.raises(ValueError, match="user_scope"):
+        build_cache_key(
+            CacheDataClass.WEB_SEARCH,
+            "tavily",
+            "python",
+            params={"user_id": "u1"},
+        )
+
+    # Global LRU eviction order test (accessing an older item promotes it so LRU item is evicted)
     fake_now = 100.0
+    lru_cache: PerClassTTLCache[int] = PerClassTTLCache(
+        max_entries=2,
+        max_entries_per_class=2,
+        clock=lambda: fake_now,
+    )
+    lru_cache.put("k1", CacheDataClass.WEATHER, "wttr", 1)
+    lru_cache.put("k2", CacheDataClass.WEB_SEARCH, "tavily", 2)
+    # Access k1 so k1 becomes most-recently-used and k2 becomes least-recently-used
+    assert lru_cache.get("k1") is not None
+    lru_cache.put("k3", CacheDataClass.NEWS_SEARCH, "tavily", 3)
+    assert lru_cache.get("k1") is not None
+    assert lru_cache.get("k2") is None
+    assert lru_cache.get("k3") is not None
+
+    # Per-class capacity limit test
     cache: PerClassTTLCache[int] = PerClassTTLCache(
         max_entries=10,
         max_entries_per_class=2,
@@ -508,7 +653,6 @@ def test_ttl_cache_per_class_limits_key_isolation_and_thread_safety() -> None:
     cache.put("w1", CacheDataClass.WEATHER, "wttr", 1)
     cache.put("w2", CacheDataClass.WEATHER, "wttr", 2)
     cache.put("w3", CacheDataClass.WEATHER, "wttr", 3)
-    # Per-class limit of 2 evicts oldest WEATHER entry ("w1") even though global max_entries is 10
     assert cache.count_by_class(CacheDataClass.WEATHER) == 2
     assert cache.get("w1") is None
     assert cache.get("w2") is not None
@@ -555,38 +699,6 @@ def test_http_redirects_errors_and_default_resolver(monkeypatch: pytest.MonkeyPa
     def pub_resolver(host: str, port: int) -> list[str]:
         return ["93.184.216.34"]
 
-    def redirect_sender(
-        url: str,
-        headers: dict[str, str],
-        connect_timeout: float,
-        read_timeout: float,
-        max_bytes: int,
-    ) -> RawHTTPResponse:
-        if url.endswith("/hop1"):
-            return RawHTTPResponse(
-                301,
-                {"location": "/hop2"},
-                b"",
-                url,
-                peer_ip="93.184.216.34",
-            )
-        return RawHTTPResponse(
-            200,
-            {"content-type": "text/plain; charset=latin-1"},
-            b"final body",
-            url,
-            peer_ip="93.184.216.34",
-        )
-
-    resp = fetch_safe_url(
-        "https://example.com/hop1",
-        resolver=pub_resolver,
-        sender=redirect_sender,
-    )
-    assert resp.final_url == "https://example.com/hop2"
-    assert resp.redirect_count == 1
-    assert resp.text == "final body"
-
     def loop_sender(
         url: str,
         headers: dict[str, str],
@@ -627,7 +739,7 @@ def test_http_redirects_errors_and_default_resolver(monkeypatch: pytest.MonkeyPa
     assert exc_429.value.details["retry_after"] == "30"
 
 
-def test_send_pinned_http_request_Rejects_empty_or_private_pinned_ips() -> None:
+def test_send_pinned_http_request_rejects_empty_or_private_pinned_ips() -> None:
     with pytest.raises(UltimateMCPError) as exc_empty:
         send_pinned_http_request(
             "http://example.com/",

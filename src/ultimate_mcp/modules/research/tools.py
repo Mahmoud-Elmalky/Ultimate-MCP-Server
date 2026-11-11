@@ -574,8 +574,9 @@ def register_research_tools(
             module="research",
             description=(
                 "Compare 2-10 supplied source excerpts deterministically using lexical overlap, "
-                "negation, numeric, and date consistency checks ('Sources agree', "
-                "'Sources disagree', or 'Insufficient evidence'; not a semantic truth oracle)."
+                "negation, numeric, temporal, and population/context checks ('No contradiction "
+                "detected', 'Conflicting evidence detected', or 'Insufficient evidence'; not a "
+                "semantic truth oracle)."
             ),
             handler=compare_sources_service,
             mcp_wrapper=compare_sources,
@@ -625,9 +626,9 @@ def register_research_tools(
             module="research",
             description=(
                 "Gather evidence across independent domains for a claim and classify status as "
-                "'Supporting evidence found', 'Conflicting evidence found', or 'Insufficient "
-                "evidence' via deterministic lexical/negation/numeric checks (not a semantic "
-                "truth oracle)."
+                "'Potential supporting evidence', 'Conflicting evidence detected', or "
+                "'Insufficient evidence' via deterministic lexical/negation/numeric/context "
+                "checks (not a semantic truth oracle)."
             ),
             handler=verify_claim_service,
             mcp_wrapper=verify_claim,

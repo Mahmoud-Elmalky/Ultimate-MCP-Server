@@ -1,8 +1,11 @@
 """Bounded, thread-safe, per-data-class TTL cache with freshness and stale guards.
 
 Follows ``phases/PHASE-02_RESEARCH_UTILITIES.md`` §F:
-- Cache keys isolate data class, provider, query/identifier, locale, and normalized parameters.
-- Rejects caching sensitive/user-specific parameter keys unless an explicit policy is passed.
+- Cache keys isolate data class, provider, query/identifier, locale, user_scope, and params.
+- Rejects caching sensitive parameter keys or credential-bearing parameter values unless an
+  explicit policy (`allow_sensitive_policy=True`) is supplied.
+- Rejects un-isolated user-specific identifiers (`user_id`, `account_id`, `tenant_id`, `email`)
+  in generic `params` unless explicitly scoped via `user_scope`.
 - TTL and maximum entry counts are enforced both globally and per data class.
 - Expired entries are purged proactively before capacity LRU eviction.
 - Thread-safe via ``threading.RLock`` for concurrent ``asyncio.to_thread`` worker execution.
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -50,6 +54,27 @@ FORBIDDEN_SENSITIVE_PARAM_KEYS: frozenset[str] = frozenset(
         "private_key",
         "bearer",
     }
+)
+
+UNISOLATED_USER_PARAM_KEYS: frozenset[str] = frozenset(
+    {
+        "user",
+        "user_id",
+        "userid",
+        "username",
+        "account",
+        "account_id",
+        "tenant",
+        "tenant_id",
+        "email",
+        "profile_id",
+    }
+)
+
+SENSITIVE_VALUE_REGEX = re.compile(
+    r"(?i)(?:\bbearer\s+[a-z0-9._\-]{8,}|\b(?:tvly|sk|rk|pk)-[a-z0-9_\-]{8,}"
+    r"|\bAIza[0-9A-Za-z_\-]{16,}|\bgh[pousr]_[0-9A-Za-z]{16,}"
+    r"|\bxox[baprs]-[0-9A-Za-z\-]{10,}|(?:api_key|access_token|password|secret)\s*[=:]\s*\S+)"
 )
 
 
@@ -131,8 +156,12 @@ class CacheLookup(Generic[T]):
         )
 
 
-def _validate_no_sensitive_params(params: dict[str, Any] | None) -> None:
-    """Reject sensitive or user-credential keys in cache parameters."""
+def _validate_cache_params_and_values(
+    params: dict[str, Any] | None,
+    *,
+    has_explicit_user_scope: bool,
+) -> None:
+    """Reject sensitive keys/values and un-isolated user-specific identifiers."""
     if not params:
         return
     for raw_key, raw_val in params.items():
@@ -142,11 +171,23 @@ def _validate_no_sensitive_params(params: dict[str, Any] | None) -> None:
         ):
             raise ValueError(
                 f"Refusing to build cache key with sensitive parameter '{raw_key}'. "
-                "Sensitive or user-specific credentials must not be cached without an explicit "
-                "security policy."
+                "Sensitive credentials must not be cached without an explicit security policy."
+            )
+        if not has_explicit_user_scope and norm_key in UNISOLATED_USER_PARAM_KEYS:
+            raise ValueError(
+                f"Refusing to cache user-specific parameter '{raw_key}' without explicit "
+                "'user_scope' isolation."
             )
         if isinstance(raw_val, dict):
-            _validate_no_sensitive_params(raw_val)
+            _validate_cache_params_and_values(
+                raw_val,
+                has_explicit_user_scope=has_explicit_user_scope,
+            )
+        elif isinstance(raw_val, str) and SENSITIVE_VALUE_REGEX.search(raw_val):
+            raise ValueError(
+                f"Refusing to build cache key: parameter '{raw_key}' contains a credential-like "
+                "secret or token value."
+            )
 
 
 def build_cache_key(
@@ -155,19 +196,29 @@ def build_cache_key(
     query: str,
     *,
     locale: str = "en",
+    user_scope: str = "public",
     params: dict[str, Any] | None = None,
     allow_sensitive_policy: bool = False,
 ) -> str:
-    """Create a deterministic SHA-256 cache key isolated by class, provider, and query."""
+    """Create a deterministic SHA-256 cache key isolated by class, provider, scope, and query."""
     if not provider or not provider.strip():
         raise ValueError("provider must not be empty when building a cache key.")
+    norm_scope = user_scope.strip().lower() or "public"
     if not allow_sensitive_policy:
-        _validate_no_sensitive_params(params)
+        if SENSITIVE_VALUE_REGEX.search(query):
+            raise ValueError(
+                "Refusing to build cache key: query string contains a credential-like secret."
+            )
+        _validate_cache_params_and_values(
+            params,
+            has_explicit_user_scope=(norm_scope != "public"),
+        )
 
     canonical = json.dumps(
         {
             "class": data_class.value,
             "provider": provider.strip().lower(),
+            "scope": norm_scope,
             "query": query.strip(),
             "locale": locale.strip().lower(),
             "params": params or {},
@@ -177,7 +228,7 @@ def build_cache_key(
         ensure_ascii=True,
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
-    return f"{data_class.value}:{provider.strip().lower()}:{digest}"
+    return f"{data_class.value}:{provider.strip().lower()}:{norm_scope}:{digest}"
 
 
 class PerClassTTLCache(Generic[T]):
@@ -251,7 +302,6 @@ class PerClassTTLCache(Generic[T]):
                 self._store.move_to_end(key)
             self._store[key] = entry
 
-            # Purge expired items before evicting live entries for capacity
             self._purge_expired_locked(now)
             if key not in self._store:
                 self._store[key] = entry
