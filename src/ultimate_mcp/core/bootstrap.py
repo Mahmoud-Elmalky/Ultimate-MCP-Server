@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import platform
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Annotated, Any
 
 from mcp.server import MCPServer
@@ -14,6 +14,7 @@ from pydantic import Field
 
 from ultimate_mcp import __version__
 from ultimate_mcp.core.approvals import ApprovalBroker
+from ultimate_mcp.core.cache import PerClassTTLCache
 from ultimate_mcp.core.config import ProfileName, Settings
 from ultimate_mcp.core.execution import ExecutionManager, TimeoutCategory
 from ultimate_mcp.core.filesystem import DEFAULT_READ_CHAR_LIMIT
@@ -22,12 +23,20 @@ from ultimate_mcp.core.permissions import PermissionLevel
 from ultimate_mcp.core.redaction import configure_logging
 from ultimate_mcp.core.registry import ToolRegistry, ToolSpec, is_package_available
 from ultimate_mcp.modules.documents.reader import read_workspace_text_file_service
+from ultimate_mcp.modules.research.tools import register_research_tools
 from ultimate_mcp.modules.system.actions import (
     execute_approved_action_service,
     prepare_write_file_service,
 )
-from ultimate_mcp.modules.utilities.calculator import calculate_service
-from ultimate_mcp.modules.utilities.clock import DEFAULT_TIMEZONE, get_current_time_service
+from ultimate_mcp.modules.utilities.tools import register_utility_tools
+from ultimate_mcp.providers.finance.yfinance_provider import YFinanceMarketProvider
+from ultimate_mcp.providers.search.adapters import (
+    DuckDuckGoSearchProvider,
+    OpenAlexAcademicProvider,
+    TavilySearchProvider,
+)
+from ultimate_mcp.providers.weather.wttr import WttrWeatherProvider
+from ultimate_mcp.providers.youtube.adapter import DefaultYouTubeProvider
 from ultimate_mcp.storage.db import check_fts5_available, init_database
 
 logger = logging.getLogger("ultimate_mcp.bootstrap")
@@ -52,6 +61,7 @@ class GatewayRuntime:
     registry: ToolRegistry
     executor: ExecutionManager
     broker: ApprovalBroker
+    cache: PerClassTTLCache[Any]
     mcp: MCPServer
 
 
@@ -72,106 +82,40 @@ def build_registry(
     settings: Settings,
     executor: ExecutionManager,
     broker: ApprovalBroker,
+    cache: PerClassTTLCache[Any] | None = None,
 ) -> ToolRegistry:
     """Construct the ``ToolRegistry`` with all implemented v2 tools."""
     registry = ToolRegistry()
+    active_cache = cache if cache is not None else PerClassTTLCache()
 
-    async def calculate(
-        expression: Annotated[
-            str,
-            Field(
-                min_length=1,
-                max_length=500,
-                description=(
-                    "Mathematical expression using numbers, +, -, *, /, //, %, **, "
-                    "constants (pi, e, tau), or allowlisted math functions (sqrt, sin, cos, "
-                    "log, round, min, max, factorial, gcd, etc.)."
-                ),
-            ),
-        ],
-    ) -> CallToolResult:
-        """Evaluate an arithmetic or math expression deterministically without eval()."""
-        res = await executor.execute(
-            "calculate",
-            calculate_service,
-            {"expression": expression},
-            permission=PermissionLevel.L0_READ,
-            timeout_category=TimeoutCategory.LOCAL,
-            idempotent=True,
-        )
-        return _adapt_result(res, settings)
+    tavily_key = settings.tavily_api_key.get_secret_value() if settings.tavily_api_key else None
+    youtube_key = settings.youtube_api_key.get_secret_value() if settings.youtube_api_key else None
+    weather_provider = WttrWeatherProvider()
+    market_provider = YFinanceMarketProvider()
+    youtube_provider = DefaultYouTubeProvider(api_key=youtube_key)
+    tavily_provider = TavilySearchProvider(api_key=tavily_key)
+    ddg_provider = DuckDuckGoSearchProvider()
+    academic_provider = OpenAlexAcademicProvider()
 
-    registry.register(
-        ToolSpec(
-            name="calculate",
-            module="utilities",
-            description=(
-                "Evaluate an exact arithmetic or mathematical expression using a strict AST "
-                "allowlist. Use instead of mental math."
-            ),
-            handler=calculate_service,
-            mcp_wrapper=calculate,
-            permission=PermissionLevel.L0_READ,
-            profiles=frozenset(
-                {
-                    ProfileName.DEFAULT,
-                    ProfileName.RESEARCH,
-                    ProfileName.CODING,
-                    ProfileName.DOCUMENTS,
-                    ProfileName.FULL,
-                }
-            ),
-            timeout_category=TimeoutCategory.LOCAL,
-            idempotent=True,
-        )
+    register_utility_tools(
+        registry=registry,
+        settings=settings,
+        executor=executor,
+        adapt_result=_adapt_result,
+        cache=active_cache,
+        weather_provider=weather_provider,
+        market_provider=market_provider,
+        youtube_provider=youtube_provider,
     )
-
-    async def get_current_time(
-        timezone: Annotated[
-            str,
-            Field(
-                min_length=1,
-                max_length=100,
-                description="IANA timezone name such as 'UTC', 'Africa/Cairo', 'Europe/London'.",
-            ),
-        ] = DEFAULT_TIMEZONE,
-    ) -> CallToolResult:
-        """Return current date, 12-hour time, ISO timestamp, and weekday in a named timezone."""
-        res = await executor.execute(
-            "get_current_time",
-            get_current_time_service,
-            {"timezone": timezone},
-            permission=PermissionLevel.L0_READ,
-            timeout_category=TimeoutCategory.LOCAL,
-            idempotent=True,
-        )
-        return _adapt_result(res, settings)
-
-    registry.register(
-        ToolSpec(
-            name="get_current_time",
-            module="utilities",
-            description=(
-                "Get the authoritative current date, time, ISO timestamp, and weekday for an "
-                "IANA timezone (default Africa/Cairo)."
-            ),
-            handler=get_current_time_service,
-            mcp_wrapper=get_current_time,
-            permission=PermissionLevel.L0_READ,
-            profiles=frozenset(
-                {
-                    ProfileName.DEFAULT,
-                    ProfileName.RESEARCH,
-                    ProfileName.CODING,
-                    ProfileName.DOCUMENTS,
-                    ProfileName.BROWSER,
-                    ProfileName.FULL,
-                }
-            ),
-            timeout_category=TimeoutCategory.LOCAL,
-            idempotent=True,
-            produces_provenance=True,
-        )
+    register_research_tools(
+        registry=registry,
+        settings=settings,
+        executor=executor,
+        adapt_result=_adapt_result,
+        cache=active_cache,
+        tavily_provider=tavily_provider,
+        ddg_provider=ddg_provider,
+        academic_provider=academic_provider,
     )
 
     async def read_text_file(
@@ -368,7 +312,8 @@ def create_gateway(
         default_ttl_seconds=cfg.approval_ttl_seconds,
         known_secrets=cfg.known_secret_values(),
     )
-    registry = build_registry(cfg, executor, broker)
+    cache: PerClassTTLCache[Any] = PerClassTTLCache()
+    registry = build_registry(cfg, executor, broker, cache=cache)
 
     mcp = MCPServer("Ultimate-MCP-Server-v2")
     for spec in registry.enabled_specs(cfg, cfg.profile):
@@ -379,6 +324,7 @@ def create_gateway(
         registry=registry,
         executor=executor,
         broker=broker,
+        cache=cache,
         mcp=mcp,
     )
 
@@ -406,6 +352,17 @@ def build_doctor_report(
             "packages": pkg_state,
         }
 
+    tavily_key = cfg.tavily_api_key.get_secret_value() if cfg.tavily_api_key else None
+    youtube_key = cfg.youtube_api_key.get_secret_value() if cfg.youtube_api_key else None
+    provider_health = {
+        "tavily": asdict(TavilySearchProvider(api_key=tavily_key).health()),
+        "duckduckgo": asdict(DuckDuckGoSearchProvider().health()),
+        "openalex": asdict(OpenAlexAcademicProvider().health()),
+        "wttr.in": asdict(WttrWeatherProvider().health()),
+        "yfinance": asdict(YFinanceMarketProvider().health()),
+        "youtube": asdict(DefaultYouTubeProvider(api_key=youtube_key).health()),
+    }
+
     tools_report = registry.catalog_report(cfg, cfg.profile)
     enabled_names = [t["name"] for t in tools_report if t["enabled"]]
 
@@ -430,6 +387,7 @@ def build_doctor_report(
         "providers": {
             "tavily_configured": cfg.tavily_api_key is not None,
             "youtube_configured": cfg.youtube_api_key is not None,
+            "health": provider_health,
         },
         "optional_groups": optional_groups,
         "enabled_tool_count": len(enabled_names),
