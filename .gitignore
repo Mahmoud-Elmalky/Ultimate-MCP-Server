@@ -1,9 +1,45 @@
+# Secrets and local configuration
 .env
-__pycache__/
+.env.*
+!.env.example
+*.pem
+*.key
 
-# Local virtual environments and tool caches
+# Python
+__pycache__/
+*.py[cod]
 .venv/
 .venv-*/
+venv/
 .pytest_cache/
-.ruff_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local state and generated artifacts
+state/
+.cache/
+artifacts/
+downloads/
+logs/
+*.sqlite3
+*.db
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Model/media weights
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

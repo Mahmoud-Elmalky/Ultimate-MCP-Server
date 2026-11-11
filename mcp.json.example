@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "ultimate-mcp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "C:/PATH/TO/Ultimate-MCP-Server",
+        "run",
+        "ultimate-mcp",
+        "serve",
+        "--profile",
+        "default"
+      ]
+    }
+  }
+}
