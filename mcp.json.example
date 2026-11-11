@@ -1,6 +1,12 @@
 {
   "mcpServers": {
-    "ultimate-mcp": {
+    "Search-Tools": {
+      "command": "python",
+      "args": [
+        "D:/Coding/projects/Python/mcp search server for LM Studio/Ultimate MCP Server/ultimate_mcp_server.py"
+      ]
+    },
+    "Ultimate-MCP-v2": {
       "command": "uv",
       "args": [
         "--directory",
@@ -10,7 +16,11 @@
         "serve",
         "--profile",
         "default"
-      ]
+      ],
+      "env": {
+        "ULTIMATE_MCP_READ_ROOTS": "C:/PATH/TO/ALLOWED_WORKSPACE",
+        "ULTIMATE_MCP_WRITE_ROOTS": "C:/PATH/TO/ALLOWED_WORKSPACE/artifacts"
+      }
     }
   }
 }
