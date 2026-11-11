@@ -109,7 +109,8 @@ async def browser_download_service(
     normalized, _ = validate_and_resolve_url(url, resolver=manager.resolver)
     normalized_url = normalized.geturl()
     safe_name = _validate_download_filename(filename, normalized.path)
-    bounded_bytes = max(1, min(int(max_bytes), DEFAULT_MAX_FILE_SIZE_BYTES))
+    max_allowed = min(settings.browser_max_download_bytes, DEFAULT_MAX_FILE_SIZE_BYTES)
+    bounded_bytes = max(1, min(int(max_bytes), max_allowed))
     dest = resolve_scoped_path(
         Path("downloads") / safe_name,
         [settings.output_dir],

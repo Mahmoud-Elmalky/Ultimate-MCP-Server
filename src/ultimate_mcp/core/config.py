@@ -36,6 +36,12 @@ DEFAULT_LOCAL_TIMEOUT_SECONDS = 5.0
 DEFAULT_NETWORK_TIMEOUT_SECONDS = 15.0
 DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 30.0
 
+DEFAULT_BROWSER_MAX_SESSIONS = 2
+DEFAULT_BROWSER_MAX_TABS = 5
+DEFAULT_BROWSER_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024
+DEFAULT_BROWSER_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+DEFAULT_BROWSER_NAV_TIMEOUT_MS = 15_000
+
 
 class ProfileName(StrEnum):
     """Startup-selected tool exposure profiles (including small-model focused profiles)."""
@@ -200,6 +206,44 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="YOUTUBE_API_KEY",
     )
+    browser_max_sessions: int = Field(
+        default=DEFAULT_BROWSER_MAX_SESSIONS,
+        ge=1,
+        le=8,
+        validation_alias="ULTIMATE_MCP_BROWSER_MAX_SESSIONS",
+    )
+    browser_max_tabs: int = Field(
+        default=DEFAULT_BROWSER_MAX_TABS,
+        ge=1,
+        le=15,
+        validation_alias="ULTIMATE_MCP_BROWSER_MAX_TABS",
+    )
+    browser_max_download_bytes: int = Field(
+        default=DEFAULT_BROWSER_MAX_DOWNLOAD_BYTES,
+        ge=1024,
+        le=20_000_000,
+        validation_alias="ULTIMATE_MCP_BROWSER_MAX_DOWNLOAD_BYTES",
+    )
+    browser_max_response_bytes: int = Field(
+        default=DEFAULT_BROWSER_MAX_RESPONSE_BYTES,
+        ge=65_536,
+        le=10_485_760,
+        validation_alias="ULTIMATE_MCP_BROWSER_MAX_RESPONSE_BYTES",
+    )
+    browser_navigation_timeout_ms: int = Field(
+        default=DEFAULT_BROWSER_NAV_TIMEOUT_MS,
+        ge=1_000,
+        le=60_000,
+        validation_alias="ULTIMATE_MCP_BROWSER_NAV_TIMEOUT_MS",
+    )
+    browser_headless: bool = Field(
+        default=True,
+        validation_alias="ULTIMATE_MCP_BROWSER_HEADLESS",
+    )
+    browser_disable_webrtc: bool = Field(
+        default=True,
+        validation_alias="ULTIMATE_MCP_BROWSER_DISABLE_WEBRTC",
+    )
 
     @field_validator("state_dir", "output_dir", mode="before")
     @classmethod
@@ -316,4 +360,11 @@ class Settings(BaseSettings):
             "subprocess_timeout_seconds": self.subprocess_timeout_seconds,
             "tavily_api_key": REDACTED_PLACEHOLDER if self.tavily_api_key else None,
             "youtube_api_key": REDACTED_PLACEHOLDER if self.youtube_api_key else None,
+            "browser_max_sessions": self.browser_max_sessions,
+            "browser_max_tabs": self.browser_max_tabs,
+            "browser_max_download_bytes": self.browser_max_download_bytes,
+            "browser_max_response_bytes": self.browser_max_response_bytes,
+            "browser_navigation_timeout_ms": self.browser_navigation_timeout_ms,
+            "browser_headless": self.browser_headless,
+            "browser_disable_webrtc": self.browser_disable_webrtc,
         }

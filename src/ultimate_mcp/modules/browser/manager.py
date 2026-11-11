@@ -52,8 +52,10 @@ class BrowserSessionManager:
         self,
         *,
         approval_broker: ApprovalBroker | None = None,
-        max_sessions: int = 3,
+        max_sessions: int = 2,
         max_tabs: int = 5,
+        max_response_bytes: int = 2 * 1024 * 1024,
+        navigation_timeout_ms: int = 15_000,
         headless: bool = True,
         disable_webrtc: bool = True,
         resolver: ResolverFunc = default_dns_resolver,
@@ -63,6 +65,8 @@ class BrowserSessionManager:
         self.approval_broker = approval_broker
         self.max_sessions = max_sessions
         self.max_tabs = max_tabs
+        self.max_response_bytes = max_response_bytes
+        self.navigation_timeout_ms = navigation_timeout_ms
         self.headless = headless
         self.disable_webrtc = disable_webrtc
         self.resolver = resolver
@@ -130,6 +134,7 @@ class BrowserSessionManager:
                 session_id=sid,
                 disable_webrtc=self.disable_webrtc,
                 max_tabs=self.max_tabs,
+                max_response_bytes=self.max_response_bytes,
                 resolver=self.resolver,
                 socket_factory=self.socket_factory,
                 ssl_wrapper=self.ssl_wrapper,

@@ -597,7 +597,9 @@ async def test_research_and_full_profile_footprints_and_wrappers(tmp_path: Path)
 
     full_report = build_doctor_report(settings=cfg, profile_override=ProfileName.FULL)
     browser_ready = bool(full_report["optional_groups"]["browser"]["all_installed"])
-    assert full_report["enabled_tool_count"] == (44 if browser_ready else 30)
+    ocr_ready = "image_ocr" in full_report["enabled_tools"]
+    expected_full = 30 + (14 if browser_ready else 0) + 8 + (1 if ocr_ready else 0)
+    assert full_report["enabled_tool_count"] == expected_full
     assert "calculate_or_time" in full_report["enabled_tools"]
     assert "youtube_expert" in full_report["enabled_tools"]
 

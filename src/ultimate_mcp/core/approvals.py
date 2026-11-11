@@ -191,7 +191,7 @@ class ApprovalBroker:
                     f"Approval ID '{approval_id}' does not exist.",
                 )
             status = ApprovalStatus(row["status"])
-            if status in (ApprovalStatus.PENDING, ApprovalStatus.APPROVED) and now > float(
+            if status in (ApprovalStatus.PENDING, ApprovalStatus.APPROVED) and now >= float(
                 row["expires_at"]
             ):
                 conn.execute("BEGIN IMMEDIATE;")
@@ -215,7 +215,7 @@ class ApprovalBroker:
                 """
                 UPDATE approvals
                    SET status = ?
-                 WHERE status IN (?, ?) AND expires_at < ?;
+                 WHERE status IN (?, ?) AND expires_at <= ?;
                 """,
                 (
                     ApprovalStatus.EXPIRED.value,
@@ -330,7 +330,7 @@ class ApprovalBroker:
                 )
 
             record = self._row_to_record(row)
-            if now > record.expires_at:
+            if now >= record.expires_at:
                 conn.execute(
                     "UPDATE approvals SET status = ? WHERE approval_id = ?;",
                     (ApprovalStatus.EXPIRED.value, approval_id),

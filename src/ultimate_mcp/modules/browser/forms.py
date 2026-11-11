@@ -101,6 +101,8 @@ async def _prepare_form_submission(
         record = prepare_browser_mutation_approval(
             broker, method=method, url=target_url, body=body_bytes,
             headers=headers, session_id=session.session_id,
+            auth_context=session.policy.auth_context,
+            cookie_header=session.policy.cookie_header,
         )
     else:
         record = broker.prepare_action(
@@ -128,6 +130,8 @@ def _preflight_mutation_approval(
     body_bytes: bytes,
     headers: dict[str, str],
     session_id: str,
+    auth_context: str = "",
+    cookie_header: str = "",
 ) -> None:
     try:
         record = broker.get_record(approval_id)
@@ -146,7 +150,8 @@ def _preflight_mutation_approval(
             f"Approval '{approval_id}' is not valid/approved for browser form mutation.",
         )
     expected = build_mutation_approval_payload(
-        method, target_url, body_bytes, headers=headers, session_id=session_id
+        method, target_url, body_bytes, headers=headers, session_id=session_id,
+        auth_context=auth_context, cookie_header=cookie_header,
     )
     if expected != record.payload:
         raise UltimateMCPError(
@@ -227,6 +232,8 @@ async def browser_submit_form_service(
         _preflight_mutation_approval(
             broker, cleaned_id, method=method, target_url=target_url,
             body_bytes=body_bytes, headers=headers, session_id=session.session_id,
+            auth_context=session.policy.auth_context,
+            cookie_header=session.policy.cookie_header,
         )
         session.policy.authorize_mutation(cleaned_id)
     else:

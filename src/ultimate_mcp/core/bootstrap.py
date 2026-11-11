@@ -28,6 +28,7 @@ from ultimate_mcp.modules.browser.manager import (
 )
 from ultimate_mcp.modules.browser.tools import register_browser_tools
 from ultimate_mcp.modules.documents.reader import read_workspace_text_file_service
+from ultimate_mcp.modules.documents.tools import register_document_tools
 from ultimate_mcp.modules.research.tools import register_research_tools
 from ultimate_mcp.modules.system.actions import (
     execute_approved_action_service,
@@ -84,6 +85,18 @@ def _adapt_result(result: ToolResult, settings: Settings) -> CallToolResult:
     )
 
 
+def _build_browser_manager(settings: Settings, broker: ApprovalBroker) -> BrowserSessionManager:
+    return BrowserSessionManager(
+        approval_broker=broker,
+        max_sessions=settings.browser_max_sessions,
+        max_tabs=settings.browser_max_tabs,
+        max_response_bytes=settings.browser_max_response_bytes,
+        navigation_timeout_ms=settings.browser_navigation_timeout_ms,
+        headless=settings.browser_headless,
+        disable_webrtc=settings.browser_disable_webrtc,
+    )
+
+
 def build_registry(
     settings: Settings,
     executor: ExecutionManager,
@@ -97,7 +110,7 @@ def build_registry(
     active_browser = (
         browser_manager
         if browser_manager is not None
-        else BrowserSessionManager(approval_broker=broker)
+        else _build_browser_manager(settings, broker)
     )
 
     tavily_key = settings.tavily_api_key.get_secret_value() if settings.tavily_api_key else None
@@ -135,6 +148,13 @@ def build_registry(
         executor=executor,
         broker=broker,
         manager=active_browser,
+        adapt_result=_adapt_result,
+    )
+    register_document_tools(
+        registry=registry,
+        settings=settings,
+        executor=executor,
+        broker=broker,
         adapt_result=_adapt_result,
     )
 
@@ -333,7 +353,7 @@ def create_gateway(
         known_secrets=cfg.known_secret_values(),
     )
     cache: PerClassTTLCache[Any] = PerClassTTLCache()
-    browser_manager = BrowserSessionManager(approval_broker=broker)
+    browser_manager = _build_browser_manager(cfg, broker)
     registry = build_registry(
         cfg,
         executor,

@@ -80,9 +80,10 @@ async def browser_open_service(
 
     session = await manager.get_or_create_session(session_id)
     page = session.current_page
+    nav_timeout = getattr(manager, "navigation_timeout_ms", DEFAULT_NAV_TIMEOUT_MS)
     try:
         resp = await page.goto(
-            normalized.geturl(), wait_until=wait_until, timeout=DEFAULT_NAV_TIMEOUT_MS
+            normalized.geturl(), wait_until=wait_until, timeout=nav_timeout
         )
     except Exception as exc:
         raise UltimateMCPError(
@@ -110,7 +111,8 @@ async def browser_back_service(
     """Navigate back in history for the active tab."""
     session = manager.get_session(session_id)
     page = session.current_page
-    resp = await page.go_back(wait_until="domcontentloaded", timeout=DEFAULT_NAV_TIMEOUT_MS)
+    nav_timeout = getattr(manager, "navigation_timeout_ms", DEFAULT_NAV_TIMEOUT_MS)
+    resp = await page.go_back(wait_until="domcontentloaded", timeout=nav_timeout)
     return ToolResult.ok(
         tool="browser_back",
         summary=f"Navigated back to '{page.url}'.",
