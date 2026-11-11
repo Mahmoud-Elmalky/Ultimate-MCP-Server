@@ -1,4 +1,9 @@
-"""Deterministic evidence workflows (Phase 02 §D, ADR-0005 — no hidden LLM calls)."""
+"""Deterministic evidence workflows (Phase 02 §D, ADR-0005 — no hidden LLM calls).
+
+Provides conservative lexical, negation, numeric, and date/year consistency checks for
+``compare_sources`` and ``verify_claim`` without declaring claims factually true from token
+overlap alone.
+"""
 
 from __future__ import annotations
 
@@ -35,7 +40,6 @@ STOPWORDS: frozenset[str] = frozenset(
         "have",
         "has",
         "had",
-        "not",
         "but",
         "what",
         "when",
@@ -54,15 +58,138 @@ STOPWORDS: frozenset[str] = frozenset(
     }
 )
 
+NEGATION_MARKERS: frozenset[str] = frozenset(
+    {
+        "not",
+        "never",
+        "no",
+        "none",
+        "false",
+        "untrue",
+        "incorrect",
+        "debunked",
+        "myth",
+        "hoax",
+        "fake",
+        "fabricated",
+        "fails",
+        "failed",
+        "cannot",
+        "cant",
+        "wont",
+        "doesnt",
+        "isnt",
+        "wasnt",
+        "werent",
+        "without",
+        "refuted",
+        "disproved",
+        "contrary",
+        "denies",
+        "denied",
+    }
+)
+
+POSITIVE_POLARITY_TERMS: frozenset[str] = frozenset(
+    {
+        "increase",
+        "increased",
+        "increases",
+        "improve",
+        "improves",
+        "improved",
+        "faster",
+        "higher",
+        "grew",
+        "rose",
+        "supported",
+        "enabled",
+        "safe",
+    }
+)
+
+NEGATIVE_POLARITY_TERMS: frozenset[str] = frozenset(
+    {
+        "decrease",
+        "decreased",
+        "decreases",
+        "degrade",
+        "degrades",
+        "degraded",
+        "slower",
+        "lower",
+        "shrank",
+        "fell",
+        "unsupported",
+        "disabled",
+        "unsafe",
+        "regression",
+    }
+)
+
+LEXICAL_LIMITATION_NOTE = (
+    "Deterministic lexical, negation, numeric, and date consistency check only (zero LLM "
+    "calls; not a semantic truth oracle). High keyword overlap does not prove factual truth; "
+    "inspect cited primary snippets and publication dates directly."
+)
+
 
 def tokenize_keywords(text: str) -> set[str]:
     """Extract lowercase alphanumeric tokens >= 3 chars excluding basic stopwords."""
     words = re.findall(r"[a-zA-Z0-9]{3,}", text.lower())
-    return {w for w in words if w not in STOPWORDS}
+    return {w for w in words if w not in STOPWORDS and w not in NEGATION_MARKERS}
+
+
+def _extract_signals(text: str) -> dict[str, Any]:
+    """Extract negation cues, years/dates, non-year numbers, and directional polarity."""
+    cleaned = text.lower().replace("'", "")
+    tokens = set(re.findall(r"[a-z0-9]+", cleaned))
+    negations = sorted(tokens.intersection(NEGATION_MARKERS))
+    years = sorted(set(re.findall(r"\b(?:19\d{2}|20\d{2})\b", cleaned)))
+    iso_dates = sorted(set(re.findall(r"\b\d{4}-\d{2}-\d{2}\b", cleaned)))
+    raw_nums = re.findall(r"\b\d+(?:\.\d+)?%?", cleaned)
+    numbers = sorted({n for n in raw_nums if n not in years})
+    pos_hits = sorted(tokens.intersection(POSITIVE_POLARITY_TERMS))
+    neg_hits = sorted(tokens.intersection(NEGATIVE_POLARITY_TERMS))
+    return {
+        "negations": negations,
+        "years": years,
+        "dates": iso_dates,
+        "numbers": numbers,
+        "positive_polarity": pos_hits,
+        "negative_polarity": neg_hits,
+    }
+
+
+def _detect_pairwise_conflicts(sig_a: dict[str, Any], sig_b: dict[str, Any]) -> list[str]:
+    """Return conservative conflict reasons between two signal dictionaries on a shared topic."""
+    conflicts: list[str] = []
+    if bool(sig_a["negations"]) != bool(sig_b["negations"]):
+        conflicts.append(
+            f"negation_mismatch ({sig_a['negations'] or ['affirmative']} vs "
+            f"{sig_b['negations'] or ['affirmative']})"
+        )
+    if (sig_a["positive_polarity"] and sig_b["negative_polarity"]) or (
+        sig_a["negative_polarity"] and sig_b["positive_polarity"]
+    ):
+        conflicts.append("directional_polarity_conflict")
+    if sig_a["dates"] and sig_b["dates"] and not set(sig_a["dates"]).intersection(sig_b["dates"]):
+        conflicts.append(f"contradictory_dates ({sig_a['dates']} vs {sig_b['dates']})")
+    elif (
+        sig_a["years"] and sig_b["years"] and not set(sig_a["years"]).intersection(sig_b["years"])
+    ):
+        conflicts.append(f"contradictory_years ({sig_a['years']} vs {sig_b['years']})")
+    if (
+        sig_a["numbers"]
+        and sig_b["numbers"]
+        and not set(sig_a["numbers"]).intersection(sig_b["numbers"])
+    ):
+        conflicts.append(f"conflicting_numeric_values ({sig_a['numbers']} vs {sig_b['numbers']})")
+    return conflicts
 
 
 def compare_sources_service(sources: list[dict[str, str]]) -> ToolResult:
-    """Compare supplied source records deterministically while retaining source IDs/URLs."""
+    """Compare supplied source records deterministically with conflict detection."""
     if not isinstance(sources, list) or len(sources) < 2 or len(sources) > 10:
         raise UltimateMCPError(
             ErrorCode.INVALID_INPUT,
@@ -71,6 +198,7 @@ def compare_sources_service(sources: list[dict[str, str]]) -> ToolResult:
 
     normalized: list[dict[str, Any]] = []
     token_sets: list[set[str]] = []
+    signals_list: list[dict[str, Any]] = []
     provenance: list[Provenance] = []
     now_iso = datetime.now(UTC).isoformat()
 
@@ -86,8 +214,11 @@ def compare_sources_service(sources: list[dict[str, str]]) -> ToolResult:
                 ErrorCode.INVALID_INPUT,
                 f"Source '{sid}' is missing 'content' or 'snippet'.",
             )
-        toks = tokenize_keywords(f"{title} {content}")
+        combined_text = f"{title} {content}"
+        toks = tokenize_keywords(combined_text)
+        sig = _extract_signals(combined_text)
         token_sets.append(toks)
+        signals_list.append(sig)
         normalized.append(
             {
                 "source_id": sid,
@@ -95,6 +226,7 @@ def compare_sources_service(sources: list[dict[str, str]]) -> ToolResult:
                 "url": url,
                 "char_length": len(content),
                 "keyword_count": len(toks),
+                "signals": sig,
             }
         )
         provenance.append(
@@ -113,15 +245,43 @@ def compare_sources_service(sources: list[dict[str, str]]) -> ToolResult:
         others = set().union(*(token_sets[j] for j in range(len(token_sets)) if j != idx))
         per_source_unique[info["source_id"]] = sorted(token_sets[idx] - others)[:15]
 
+    conflicts_detected: list[dict[str, Any]] = []
+    for i in range(len(normalized)):
+        for j in range(i + 1, len(normalized)):
+            pair_shared = token_sets[i].intersection(token_sets[j])
+            if len(pair_shared) >= 1:
+                reasons = _detect_pairwise_conflicts(signals_list[i], signals_list[j])
+                if reasons:
+                    conflicts_detected.append(
+                        {
+                            "source_a": normalized[i]["source_id"],
+                            "source_b": normalized[j]["source_id"],
+                            "shared_topic_terms": sorted(pair_shared)[:10],
+                            "conflict_reasons": reasons,
+                        }
+                    )
+
+    if conflicts_detected:
+        comparison_status = "Sources disagree"
+    elif len(shared_terms) >= 2:
+        comparison_status = "Sources agree"
+    else:
+        comparison_status = "Insufficient evidence"
+
     return ToolResult.ok(
         tool="compare_sources",
         summary=(
-            f"Compared {len(normalized)} sources; found {len(shared_terms)} shared key terms."
+            f"Compared {len(normalized)} sources: status='{comparison_status}', "
+            f"shared_terms={len(shared_terms)}, conflicts={len(conflicts_detected)}."
         ),
         data={
+            "comparison_status": comparison_status,
             "sources": normalized,
             "shared_terms": shared_terms,
             "unique_terms_by_source": per_source_unique,
+            "conflicts_detected": conflicts_detected,
+            "verification_methodology": "deterministic_lexical_and_signal_comparison",
+            "uncertainty_note": LEXICAL_LIMITATION_NOTE,
         },
         provenance=provenance,
     )
@@ -133,10 +293,7 @@ def verify_claim_service(
     providers: list[SearchProvider],
     max_results_per_provider: int = 4,
 ) -> ToolResult:
-    """Gather independent sources for ``claim`` and report lexical overlap and uncertainty.
-
-    Does NOT act as a truth oracle; the host model must inspect the cited evidence.
-    """
+    """Gather independent sources for ``claim`` and classify supporting/conflicting evidence."""
     cleaned = claim.strip()
     if len(cleaned) < 5 or len(cleaned) > 500:
         raise UltimateMCPError(
@@ -151,22 +308,38 @@ def verify_claim_service(
         max_results_per_provider=max_results_per_provider,
     )
     claim_tokens = tokenize_keywords(cleaned)
+    claim_signals = _extract_signals(cleaned)
     raw_results: list[dict[str, Any]] = multi_res.data.get("results", [])
 
     evidence_items: list[dict[str, Any]] = []
     domains: set[str] = set()
-    high_overlap_count = 0
+    supporting_domains: set[str] = set()
+    supporting_count = 0
+    conflicting_count = 0
 
     for idx, row in enumerate(raw_results):
         url = str(row.get("url") or "")
         host = (urllib.parse.urlsplit(url).hostname or "").lower().removeprefix("www.")
         if host:
             domains.add(host)
-        row_tokens = tokenize_keywords(f"{row.get('title', '')} {row.get('snippet', '')}")
+        combined = f"{row.get('title', '')} {row.get('snippet', '')}"
+        row_tokens = tokenize_keywords(combined)
+        row_signals = _extract_signals(combined)
         overlap = sorted(claim_tokens.intersection(row_tokens))
         ratio = round(len(overlap) / max(1, len(claim_tokens)), 3)
-        if ratio >= 0.5:
-            high_overlap_count += 1
+
+        conflicts = _detect_pairwise_conflicts(claim_signals, row_signals) if overlap else []
+        if ratio >= 0.4 and conflicts:
+            stance = "conflicting"
+            conflicting_count += 1
+        elif ratio >= 0.5 and not conflicts:
+            stance = "supporting"
+            supporting_count += 1
+            if host:
+                supporting_domains.add(host)
+        else:
+            stance = "insufficient"
+
         evidence_items.append(
             {
                 "evidence_id": f"ev_{idx + 1}",
@@ -178,31 +351,42 @@ def verify_claim_service(
                 "published_at": row.get("published_at"),
                 "claim_term_overlap_ratio": ratio,
                 "matched_claim_terms": overlap,
+                "stance": stance,
+                "conflict_reasons": conflicts,
             }
         )
 
-    if len(domains) >= 2 and high_overlap_count >= 2:
-        strength = "multiple_independent_matches"
-    elif high_overlap_count >= 1:
-        strength = "single_or_partial_match"
+    if conflicting_count > 0:
+        verification_status = "Conflicting evidence found"
+        strength = "conflicting_evidence"
+    elif supporting_count >= 1:
+        verification_status = "Supporting evidence found"
+        strength = (
+            "multiple_independent_matches"
+            if len(supporting_domains) >= 2 and supporting_count >= 2
+            else "single_or_partial_match"
+        )
     else:
+        verification_status = "Insufficient evidence"
         strength = "insufficient_evidence"
 
     return ToolResult.ok(
         tool="verify_claim",
         summary=(
-            f"Gathered {len(evidence_items)} source(s) across {len(domains)} independent "
-            f"domain(s); evidence_strength='{strength}'."
+            f"Gathered {len(evidence_items)} source(s) across {len(domains)} domain(s): "
+            f"status='{verification_status}', supporting={supporting_count}, "
+            f"conflicting={conflicting_count}."
         ),
         data={
             "claim": cleaned,
+            "verification_status": verification_status,
             "evidence_strength": strength,
             "independent_domain_count": len(domains),
-            "high_overlap_source_count": high_overlap_count,
-            "uncertainty_note": (
-                "Deterministic lexical evidence gathering only (not a semantic truth "
-                "oracle). Verify snippets and dates directly before concluding."
-            ),
+            "high_overlap_source_count": supporting_count,
+            "supporting_source_count": supporting_count,
+            "conflicting_source_count": conflicting_count,
+            "verification_methodology": "deterministic_lexical_negation_numeric_check",
+            "uncertainty_note": LEXICAL_LIMITATION_NOTE,
             "evidence": evidence_items,
         },
         warnings=multi_res.warnings,
@@ -251,10 +435,9 @@ def deep_research_service(
             if norm in seen_urls:
                 continue
             seen_urls.add(norm)
-            source_id = f"src_{len(all_findings) + 1}"
             all_findings.append(
                 {
-                    "source_id": source_id,
+                    "source_id": f"src_{len(all_findings) + 1}",
                     "query": q,
                     "title": row.get("title"),
                     "url": row.get("url"),
@@ -336,12 +519,8 @@ def research_report_service(
             if unc.strip():
                 lines.append(f"- {unc.strip()}")
     else:
-        lines.append(
-            "- Findings are assembled from external search snippets and have not been "
-            "independently audited beyond the cited URLs."
-        )
+        lines.append(f"- {LEXICAL_LIMITATION_NOTE}")
 
-    markdown = "\n".join(lines)
     return ToolResult.ok(
         tool="research_report",
         summary=(
@@ -349,7 +528,7 @@ def research_report_service(
         ),
         data={
             "topic": cleaned_topic,
-            "markdown": markdown,
+            "markdown": "\n".join(lines),
             "citations": citations,
         },
         provenance=provenance,

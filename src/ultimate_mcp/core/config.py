@@ -38,9 +38,14 @@ DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 30.0
 
 
 class ProfileName(StrEnum):
-    """Startup-selected tool exposure profiles."""
+    """Startup-selected tool exposure profiles (including small-model focused profiles)."""
 
     DEFAULT = "default"
+    SEARCH = "search"
+    WEB_RESEARCH = "web_research"
+    FACT_CHECK = "fact_check"
+    LIVE_DATA = "live_data"
+    YOUTUBE = "youtube"
     RESEARCH = "research"
     CODING = "coding"
     DOCUMENTS = "documents"

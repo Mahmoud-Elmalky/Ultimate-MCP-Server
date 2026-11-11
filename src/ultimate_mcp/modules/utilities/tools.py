@@ -84,6 +84,8 @@ def register_utility_tools(
             profiles=frozenset(
                 {
                     ProfileName.DEFAULT,
+                    ProfileName.SEARCH,
+                    ProfileName.LIVE_DATA,
                     ProfileName.RESEARCH,
                     ProfileName.CODING,
                     ProfileName.DOCUMENTS,
@@ -130,6 +132,11 @@ def register_utility_tools(
             profiles=frozenset(
                 {
                     ProfileName.DEFAULT,
+                    ProfileName.SEARCH,
+                    ProfileName.WEB_RESEARCH,
+                    ProfileName.FACT_CHECK,
+                    ProfileName.LIVE_DATA,
+                    ProfileName.YOUTUBE,
                     ProfileName.RESEARCH,
                     ProfileName.CODING,
                     ProfileName.DOCUMENTS,
@@ -176,7 +183,9 @@ def register_utility_tools(
             handler=convert_units_service,
             mcp_wrapper=convert_units,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.LIVE_DATA, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.LOCAL,
             idempotent=True,
             produces_provenance=True,
@@ -221,7 +230,9 @@ def register_utility_tools(
             handler=get_weather_service,
             mcp_wrapper=get_weather,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.LIVE_DATA, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -262,7 +273,9 @@ def register_utility_tools(
             handler=get_market_price_service,
             mcp_wrapper=get_market_price,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.LIVE_DATA, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -321,7 +334,9 @@ def register_utility_tools(
             handler=get_exchange_rate_service,
             mcp_wrapper=get_exchange_rate,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.LIVE_DATA, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -362,7 +377,9 @@ def register_utility_tools(
             handler=youtube_search_service,
             mcp_wrapper=youtube_search,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.YOUTUBE, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -416,7 +433,9 @@ def register_utility_tools(
             handler=youtube_transcript_service,
             mcp_wrapper=youtube_transcript,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.YOUTUBE, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -461,7 +480,9 @@ def register_utility_tools(
             handler=youtube_comments_service,
             mcp_wrapper=youtube_comments,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.YOUTUBE, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,

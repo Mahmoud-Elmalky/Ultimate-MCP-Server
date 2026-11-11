@@ -335,25 +335,77 @@ def test_webpage_extraction_links_tables_crawler_and_rss() -> None:
 
 
 def test_deterministic_evidence_workflows() -> None:
+    # 1. Sources agree on shared topic with consistent signals
     comp = compare_sources_service(
         [
             {
                 "id": "s1",
                 "title": "Python 3.12 Release",
                 "url": "https://docs.python.org/3.12/",
-                "content": "Python 3.12 improves error messages and asyncio performance.",
+                "content": "Python 3.12 improves error messages and asyncio performance in 2023.",
             },
             {
                 "id": "s2",
                 "title": "RealPython Review",
                 "url": "https://realpython.com/3.12/",
-                "content": "Python 3.12 improves asyncio speed and subinterpreters.",
+                "content": "Python 3.12 improves asyncio speed and subinterpreters in 2023.",
             },
         ]
     )
     assert comp.status == ResultStatus.SUCCESS
+    assert comp.data["comparison_status"] == "Sources agree"
+    assert comp.data["conflicts_detected"] == []
     assert "python" in comp.data["shared_terms"]
     assert "asyncio" in comp.data["shared_terms"]
+
+    # 2. Sources disagree due to negation despite high lexical overlap
+    comp_neg = compare_sources_service(
+        [
+            {
+                "id": "s1",
+                "title": "Claim A",
+                "content": "The 2026 solar battery prototype achieved 45% efficiency in lab tests.",
+            },
+            {
+                "id": "s2",
+                "title": "Fact Check B",
+                "content": (
+                    "The 2026 solar battery prototype did not achieve 45% efficiency in lab tests."
+                ),
+            },
+        ]
+    )
+    assert comp_neg.data["comparison_status"] == "Sources disagree"
+    assert len(comp_neg.data["conflicts_detected"]) == 1
+
+    # 3. Sources disagree due to conflicting numeric values and contradictory years
+    comp_num = compare_sources_service(
+        [
+            {
+                "id": "s1",
+                "title": "Report 1",
+                "content": "Project Aurora launched in 2022 with 15% latency reduction.",
+            },
+            {
+                "id": "s2",
+                "title": "Report 2",
+                "content": "Project Aurora launched in 2024 with 40% latency reduction.",
+            },
+        ]
+    )
+    assert comp_num.data["comparison_status"] == "Sources disagree"
+    reasons = comp_num.data["conflicts_detected"][0]["conflict_reasons"]
+    assert any("contradictory_years" in r for r in reasons)
+    assert any("conflicting_numeric_values" in r for r in reasons)
+
+    # 4. Insufficient evidence when sources share < 2 topical terms
+    comp_insuff = compare_sources_service(
+        [
+            {"id": "s1", "title": "Cooking", "content": "Baking sourdough bread requires flour."},
+            {"id": "s2", "title": "Astrophysics", "content": "Neutron stars emit radio pulses."},
+        ]
+    )
+    assert comp_insuff.data["comparison_status"] == "Insufficient evidence"
 
     class FakeProvider:
         name = "mock_search"
@@ -391,8 +443,53 @@ def test_deterministic_evidence_workflows() -> None:
         "Python 3.12 improves asyncio performance",
         providers=[FakeProvider()],
     )
+    assert ver.data["verification_status"] == "Supporting evidence found"
     assert ver.data["evidence_strength"] == "multiple_independent_matches"
     assert ver.data["independent_domain_count"] == 2
+
+    # Conflicting evidence: high lexical overlap but negation or conflicting numbers/dates
+    class ConflictingProvider:
+        name = "mock_conflict"
+
+        def health(self) -> Any:
+            return None
+
+        def search(
+            self,
+            query: str,
+            *,
+            max_results: int = 5,
+            search_type: str = "general",
+        ) -> list[SearchResultItem]:
+            return [
+                SearchResultItem(
+                    title="Debunking Python 3.12 80% speedup myth",
+                    url="https://bench.example.org/debunk",
+                    snippet=(
+                        "Claims that Python 3.12 improves asyncio performance by 80% in 2025 "
+                        "are false and debunked; actual improvement was 15% in 2023."
+                    ),
+                    provider="mock_conflict",
+                    rank=1,
+                    retrieved_at="2026-11-11T19:00:00+00:00",
+                )
+            ]
+
+    ver_conflict = verify_claim_service(
+        "Python 3.12 improves asyncio performance by 80% in 2025",
+        providers=[ConflictingProvider()],
+    )
+    assert ver_conflict.data["verification_status"] == "Conflicting evidence found"
+    assert ver_conflict.data["evidence_strength"] == "conflicting_evidence"
+    assert ver_conflict.data["conflicting_source_count"] == 1
+
+    # Insufficient evidence when results do not overlap the claim
+    ver_insuff = verify_claim_service(
+        "Quantum teleportation across transatlantic fiber optics in 1998",
+        providers=[FakeProvider()],
+    )
+    assert ver_insuff.data["verification_status"] == "Insufficient evidence"
+    assert ver_insuff.data["evidence_strength"] == "insufficient_evidence"
 
     deep = deep_research_service(
         "Python 3.12 performance",
@@ -428,6 +525,29 @@ async def test_research_and_full_profile_footprints_and_wrappers(tmp_path: Path)
     assert full_report["enabled_tool_count"] == 30
     assert "calculate_or_time" in full_report["enabled_tools"]
     assert "youtube_expert" in full_report["enabled_tools"]
+
+    # Focused small-model profiles (4k-8k context window friendly)
+    search_rep = build_doctor_report(settings=cfg, profile_override=ProfileName.SEARCH)
+    assert search_rep["enabled_tool_count"] == 7
+    assert "web_search" in search_rep["enabled_tools"]
+
+    web_res_rep = build_doctor_report(settings=cfg, profile_override=ProfileName.WEB_RESEARCH)
+    assert web_res_rep["enabled_tool_count"] == 7
+    assert "read_webpage" in web_res_rep["enabled_tools"]
+
+    fact_rep = build_doctor_report(settings=cfg, profile_override=ProfileName.FACT_CHECK)
+    assert fact_rep["enabled_tool_count"] == 7
+    assert "verify_claim" in fact_rep["enabled_tools"]
+    assert "compare_sources" in fact_rep["enabled_tools"]
+
+    live_rep = build_doctor_report(settings=cfg, profile_override=ProfileName.LIVE_DATA)
+    assert live_rep["enabled_tool_count"] == 6
+    assert "get_weather" in live_rep["enabled_tools"]
+    assert "get_market_price" in live_rep["enabled_tools"]
+
+    yt_rep = build_doctor_report(settings=cfg, profile_override=ProfileName.YOUTUBE)
+    assert yt_rep["enabled_tool_count"] == 4
+    assert "youtube_transcript" in yt_rep["enabled_tools"]
 
     gw = create_gateway(settings=cfg, profile_override=ProfileName.FULL)
     unit_spec = gw.registry.get("convert_units")

@@ -1,22 +1,23 @@
 """SSRF-hardened outbound HTTP fetching layer (``docs/SECURITY_MODEL.md`` §5).
 
-Security invariants:
-1. Permits ONLY ``http`` and ``https`` schemes; rejects empty/malformed URLs, userinfo
-   credentials (`user:pass@host`), and non-standard ports (unless explicitly allowlisted).
-2. Rejects localhost aliases (`localhost`, `*.localhost`, `*.local`), IP literals, and DNS
-   resolutions that point to any loopback, private, link-local, multicast, unspecified,
-   reserved, carrier-grade NAT (`100.64.0.0/10`), benchmarking, or cloud metadata address
-   (both IPv4 and IPv6, including IPv4-mapped IPv6 addresses like `::ffff:127.0.0.1` and
-   `::ffff:169.254.169.254`).
-3. Disables automatic redirects (`follow_redirects=False`); manually follows up to
-   ``max_redirects`` hops while re-validating the target URL and re-resolving DNS at every
-   hop.
-4. Defends against DNS rebinding (TOCTOU between pre-flight DNS resolution and socket
-   connection) by re-resolving the hostname immediately after the connection completes and
-   verifying that all resolved addresses remain public and overlap the pre-validated IP set.
-5. Enforces connect, read, and total timeouts, content-type allowlists, and streaming
-   response byte caps (`max_response_bytes`) so oversized responses are aborted before
-   buffering in memory.
+9-Step Pinned Network Execution Path:
+1. URL parsing (scheme ``http``/``https``, no userinfo, forbidden host/suffix, port allowlist).
+2. DNS resolution via ``resolver(host, port)`` returning all A and AAAA records.
+3. IP validation via ``is_public_ip_address`` across ALL returned A/AAAA records (mixed
+   public/private DNS responses are rejected immediately).
+4. Elimination of independent HTTP-client DNS lookup: connection is pinned directly to the
+   validated IP literal ``pre_ips[0]``.
+5. Direct TCP socket connection to ``(pinned_ip, port)`` with ``connect_timeout``, ignoring
+   environment proxy variables (``HTTP_PROXY``, ``HTTPS_PROXY``, ``ALL_PROXY``).
+6. Connected socket peer-IP verification (``sock.getpeername()[0]``) against ``pre_ips`` and
+   ``is_public_ip_address`` BEFORE TLS handshake or transmitting any HTTP request bytes.
+7. TLS handshake (for ``https``) with ``server_hostname=expected_host`` (preserving SNI and
+   X.509 certificate hostname verification).
+8. HTTP GET request transmission with ``Host: <expected_host>`` and ``Connection: close``
+   (preventing connection-pool reuse), followed by bounded streaming read up to
+   ``max_response_bytes``.
+9. Post-request peer-IP and DNS re-verification, plus full independent re-validation on every
+   redirect hop up to ``max_redirects``.
 """
 
 from __future__ import annotations
@@ -29,7 +30,36 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from ultimate_mcp.core.http_transport import (
+    RawHTTPResponse,
+    SocketFactory,
+    SSLWrapper,
+    default_socket_factory,
+    default_ssl_wrapper,
+    normalize_socket_ip,
+    send_pinned_http_request,
+)
 from ultimate_mcp.core.models import ErrorCode, UltimateMCPError
+
+__all__ = [
+    "ALLOWED_SCHEMES",
+    "DEFAULT_ALLOWED_CONTENT_TYPES",
+    "DEFAULT_ALLOWED_PORTS",
+    "DEFAULT_CONNECT_TIMEOUT",
+    "DEFAULT_MAX_REDIRECTS",
+    "DEFAULT_MAX_RESPONSE_BYTES",
+    "DEFAULT_READ_TIMEOUT",
+    "RawHTTPResponse",
+    "ResolverFunc",
+    "SafeHttpResponse",
+    "SocketFactory",
+    "SSLWrapper",
+    "TransportSender",
+    "default_dns_resolver",
+    "fetch_safe_url",
+    "is_public_ip_address",
+    "validate_and_resolve_url",
+]
 
 ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 DEFAULT_ALLOWED_PORTS: frozenset[int] = frozenset({80, 443})
@@ -76,18 +106,8 @@ IPV6_DOC_NET = ipaddress.IPv6Network("2001:db8::/32")
 ResolverFunc = Callable[[str, int], list[str]]
 TransportSender = Callable[
     [str, dict[str, str], float, float, int],
-    "RawHTTPResponse",
+    RawHTTPResponse,
 ]
-
-
-@dataclass(frozen=True)
-class RawHTTPResponse:
-    """Low-level HTTP response returned by a single non-redirecting request."""
-
-    status_code: int
-    headers: dict[str, str]
-    body: bytes
-    url: str
 
 
 @dataclass(frozen=True)
@@ -131,15 +151,11 @@ def is_public_ip_address(ip_str: str) -> bool:
             return False
         if addr == ipaddress.IPv4Address("255.255.255.255"):
             return False
-        if not addr.is_global:
-            return False
-    else:
-        if addr.is_site_local or addr in IPV6_DISCARD_NET or addr in IPV6_DOC_NET:
-            return False
-        if not addr.is_global:
-            return False
+        return bool(addr.is_global)
 
-    return True
+    if addr.is_site_local or addr in IPV6_DISCARD_NET or addr in IPV6_DOC_NET:
+        return False
+    return bool(addr.is_global)
 
 
 def default_dns_resolver(host: str, port: int) -> list[str]:
@@ -155,9 +171,7 @@ def default_dns_resolver(host: str, port: int) -> list[str]:
 
     ips: list[str] = []
     for _family, _type, _proto, _canon, sockaddr in infos:
-        ip_str = str(sockaddr[0])
-        if "%" in ip_str:
-            ip_str = ip_str.split("%", 1)[0]
+        ip_str = normalize_socket_ip(str(sockaddr[0]))
         if ip_str not in ips:
             ips.append(ip_str)
     if not ips:
@@ -191,21 +205,15 @@ def validate_and_resolve_url(
             ErrorCode.SSRF_BLOCKED,
             f"Disallowed URL scheme '{parsed.scheme}'. Only http and https are permitted.",
         )
-
     if parsed.username is not None or parsed.password is not None:
         raise UltimateMCPError(
             ErrorCode.SSRF_BLOCKED,
             "URLs containing embedded userinfo credentials are not permitted.",
         )
 
-    hostname = parsed.hostname
-    if not hostname:
-        raise UltimateMCPError(ErrorCode.INVALID_INPUT, "URL is missing a valid hostname.")
-
-    host_lower = hostname.strip().rstrip(".").lower()
+    host_lower = (parsed.hostname or "").strip().rstrip(".").lower()
     if not host_lower:
-        raise UltimateMCPError(ErrorCode.INVALID_INPUT, "URL hostname is empty.")
-
+        raise UltimateMCPError(ErrorCode.INVALID_INPUT, "URL is missing a valid hostname.")
     if host_lower in FORBIDDEN_HOSTNAMES or host_lower.endswith(FORBIDDEN_HOST_SUFFIXES):
         raise UltimateMCPError(
             ErrorCode.SSRF_BLOCKED,
@@ -224,34 +232,7 @@ def validate_and_resolve_url(
             f"Port {effective_port} is not in the allowed outbound port list.",
         )
 
-    # Check if hostname is already an IP literal
-    try:
-        ip_obj = ipaddress.ip_address(host_lower)
-    except ValueError:
-        ip_obj = None
-
-    if ip_obj is not None:
-        literal_ip = str(ip_obj)
-        if not is_public_ip_address(literal_ip):
-            raise UltimateMCPError(
-                ErrorCode.SSRF_BLOCKED,
-                f"Target IP literal '{literal_ip}' is in a restricted/private range.",
-            )
-        resolved_ips = [literal_ip]
-    else:
-        resolved_ips = resolver(host_lower, effective_port)
-        if not resolved_ips:
-            raise UltimateMCPError(
-                ErrorCode.PROVIDER_UNAVAILABLE,
-                f"No DNS records resolved for '{host_lower}'.",
-            )
-        for ip_str in resolved_ips:
-            if not is_public_ip_address(ip_str):
-                raise UltimateMCPError(
-                    ErrorCode.SSRF_BLOCKED,
-                    f"Host '{host_lower}' resolved to restricted address '{ip_str}'.",
-                )
-
+    resolved_ips = _resolve_and_validate_host_ips(host_lower, effective_port, resolver)
     normalized = urllib.parse.ParseResult(
         scheme=scheme,
         netloc=parsed.netloc,
@@ -260,7 +241,46 @@ def validate_and_resolve_url(
         query=parsed.query,
         fragment="",
     )
-    return normalized, tuple(resolved_ips)
+    return normalized, resolved_ips
+
+
+def _resolve_and_validate_host_ips(
+    host_lower: str,
+    effective_port: int,
+    resolver: ResolverFunc,
+) -> tuple[str, ...]:
+    """Resolve IP literals or DNS A/AAAA records and reject any non-public address."""
+    try:
+        ip_obj = ipaddress.ip_address(host_lower)
+    except ValueError:
+        ip_obj = None
+
+    if ip_obj is not None:
+        literal_ip = normalize_socket_ip(str(ip_obj))
+        if not is_public_ip_address(literal_ip):
+            raise UltimateMCPError(
+                ErrorCode.SSRF_BLOCKED,
+                f"Target IP literal '{literal_ip}' is in a restricted/private range.",
+            )
+        return (literal_ip,)
+
+    raw_ips = resolver(host_lower, effective_port)
+    if not raw_ips:
+        raise UltimateMCPError(
+            ErrorCode.PROVIDER_UNAVAILABLE,
+            f"No DNS records resolved for '{host_lower}'.",
+        )
+    normalized_ips: list[str] = []
+    for ip_str in raw_ips:
+        clean_ip = normalize_socket_ip(ip_str)
+        if not is_public_ip_address(clean_ip):
+            raise UltimateMCPError(
+                ErrorCode.SSRF_BLOCKED,
+                f"Host '{host_lower}' resolved to restricted address '{ip_str}'.",
+            )
+        if clean_ip not in normalized_ips:
+            normalized_ips.append(clean_ip)
+    return tuple(normalized_ips)
 
 
 def _extract_content_type(headers: dict[str, str]) -> str:
@@ -279,79 +299,69 @@ def _extract_charset(headers: dict[str, str]) -> str:
     return "utf-8"
 
 
-def _default_httpx_sender(
-    url: str,
-    headers: dict[str, str],
-    connect_timeout: float,
-    read_timeout: float,
-    max_response_bytes: int,
-) -> RawHTTPResponse:
-    """Perform a single non-redirecting streaming HTTP GET via ``httpx``."""
-    try:
-        import importlib
-
-        httpx: Any = importlib.import_module("httpx")
-    except ImportError as exc:
-        raise UltimateMCPError(
-            ErrorCode.PROVIDER_UNAVAILABLE,
-            "Optional package 'httpx' is required for web fetching (install `[research]`).",
-        ) from exc
-
-    timeout = httpx.Timeout(
-        timeout=connect_timeout + read_timeout,
-        connect=connect_timeout,
-        read=read_timeout,
-    )
-    try:
-        with (
-            httpx.Client(
-                follow_redirects=False,
-                timeout=timeout,
-                trust_env=False,
-            ) as client,
-            client.stream("GET", url, headers=headers) as response,
-        ):
-            resp_headers = {k.lower(): v for k, v in response.headers.items()}
-            cl_header = resp_headers.get("content-length")
-            if cl_header and cl_header.isdigit() and int(cl_header) > max_response_bytes:
-                raise UltimateMCPError(
-                    ErrorCode.RESOURCE_LIMIT_EXCEEDED,
-                    f"Response Content-Length ({cl_header} bytes) exceeds limit "
-                    f"({max_response_bytes} bytes).",
-                )
-
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in response.iter_bytes(chunk_size=16384):
-                total += len(chunk)
-                if total > max_response_bytes:
-                    raise UltimateMCPError(
-                        ErrorCode.RESOURCE_LIMIT_EXCEEDED,
-                        f"Response stream exceeded maximum allowed size "
-                        f"({max_response_bytes} bytes).",
-                    )
-                chunks.append(chunk)
-
-            return RawHTTPResponse(
-                status_code=response.status_code,
-                headers=resp_headers,
-                body=b"".join(chunks),
-                url=str(response.url),
+def _verify_post_request_dns_and_peer(
+    parsed: urllib.parse.ParseResult,
+    pre_ips: tuple[str, ...],
+    raw: RawHTTPResponse,
+    resolver: ResolverFunc,
+) -> tuple[str, ...]:
+    """Verify actual peer IP and post-request DNS resolution against ``pre_ips``."""
+    allowed_set = frozenset(normalize_socket_ip(ip) for ip in pre_ips)
+    if raw.peer_ip is not None:
+        peer_norm = normalize_socket_ip(raw.peer_ip)
+        if not is_public_ip_address(peer_norm) or peer_norm not in allowed_set:
+            raise UltimateMCPError(
+                ErrorCode.SSRF_BLOCKED,
+                f"Actual peer IP '{raw.peer_ip}' violated pinned IP policy {sorted(allowed_set)}.",
             )
-    except UltimateMCPError:
-        raise
-    except httpx.TimeoutException as exc:
+
+    host_lower = (parsed.hostname or "").strip().rstrip(".").lower()
+    effective_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        ipaddress.ip_address(host_lower)
+        return pre_ips
+    except ValueError:
+        pass
+
+    post_raw = resolver(host_lower, effective_port)
+    post_ips: list[str] = []
+    for ip_str in post_raw:
+        clean_ip = normalize_socket_ip(ip_str)
+        if not is_public_ip_address(clean_ip):
+            raise UltimateMCPError(
+                ErrorCode.SSRF_BLOCKED,
+                f"DNS rebinding detected: '{host_lower}' resolved to restricted "
+                f"address '{ip_str}' during request.",
+            )
+        post_ips.append(clean_ip)
+    if not allowed_set.intersection(post_ips):
         raise UltimateMCPError(
-            ErrorCode.TIMEOUT,
-            f"HTTP request timed out: {exc}",
-            retryable=True,
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise UltimateMCPError(
-            ErrorCode.PROVIDER_UNAVAILABLE,
-            f"HTTP transport error: {exc}",
-            retryable=True,
-        ) from exc
+            ErrorCode.SSRF_BLOCKED,
+            f"DNS rebinding suspected: '{host_lower}' changed IP set between "
+            "validation and response.",
+        )
+    return tuple(post_ips)
+
+
+def _raise_for_error_status(raw: RawHTTPResponse, normalized_url: str) -> None:
+    """Raise a normalized ``UltimateMCPError`` when ``raw.status_code >= 400``."""
+    retryable = raw.status_code in (429, 500, 502, 503, 504)
+    if raw.status_code == 429:
+        code = ErrorCode.RATE_LIMITED
+    elif raw.status_code == 404:
+        code = ErrorCode.NOT_FOUND
+    else:
+        code = ErrorCode.UPSTREAM_INVALID_RESPONSE
+    details: dict[str, Any] = {"status_code": raw.status_code, "url": normalized_url}
+    retry_after = next((v for k, v in raw.headers.items() if k.lower() == "retry-after"), None)
+    if retry_after:
+        details["retry_after"] = retry_after
+    raise UltimateMCPError(
+        code,
+        f"Upstream returned HTTP {raw.status_code} for '{normalized_url}'.",
+        retryable=retryable,
+        details=details,
+    )
 
 
 def fetch_safe_url(
@@ -366,14 +376,15 @@ def fetch_safe_url(
     read_timeout: float = DEFAULT_READ_TIMEOUT,
     resolver: ResolverFunc = default_dns_resolver,
     sender: TransportSender | None = None,
+    socket_factory: SocketFactory = default_socket_factory,
+    ssl_wrapper: SSLWrapper = default_ssl_wrapper,
 ) -> SafeHttpResponse:
-    """Fetch a public HTTP(S) URL with SSRF, DNS-rebinding, redirect, and byte-budget guards."""
+    """Fetch a public HTTP(S) URL with pinned-IP SSRF, DNS-rebinding, and byte-budget guards."""
     if max_redirects < 0 or max_redirects > 10:
         raise UltimateMCPError(ErrorCode.INVALID_INPUT, "max_redirects must be between 0 and 10.")
     if max_response_bytes <= 0:
         raise UltimateMCPError(ErrorCode.INVALID_INPUT, "max_response_bytes must be > 0.")
 
-    active_sender = sender or _default_httpx_sender
     req_headers: dict[str, str] = {
         "User-Agent": (
             "UltimateMCPServer/2.0 (+https://github.com/Mahmoud-Elmalky/Ultimate-MCP-Server)"
@@ -402,41 +413,28 @@ def fetch_safe_url(
             )
         visited_urls.add(normalized_url)
 
-        raw = active_sender(
-            normalized_url,
-            req_headers,
-            connect_timeout,
-            read_timeout,
-            max_response_bytes,
-        )
-
-        # Post-connection DNS rebinding check: re-resolve and ensure all returned IPs
-        # remain public and overlap with pre-validated IPs.
-        host_lower = (parsed.hostname or "").strip().rstrip(".").lower()
-        effective_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        try:
-            ip_literal = ipaddress.ip_address(host_lower)
-        except ValueError:
-            ip_literal = None
-
-        if ip_literal is not None:
-            post_ips = list(pre_ips)
+        if sender is not None:
+            raw = sender(
+                normalized_url,
+                req_headers,
+                connect_timeout,
+                read_timeout,
+                max_response_bytes,
+            )
         else:
-            post_ips = resolver(host_lower, effective_port)
-            for ip_str in post_ips:
-                if not is_public_ip_address(ip_str):
-                    raise UltimateMCPError(
-                        ErrorCode.SSRF_BLOCKED,
-                        f"DNS rebinding detected: '{host_lower}' resolved to restricted "
-                        f"address '{ip_str}' during request.",
-                    )
-            if not set(pre_ips).intersection(post_ips):
-                raise UltimateMCPError(
-                    ErrorCode.SSRF_BLOCKED,
-                    f"DNS rebinding suspected: '{host_lower}' changed IP set between "
-                    "validation and response.",
-                )
+            raw = send_pinned_http_request(
+                normalized_url,
+                req_headers,
+                connect_timeout,
+                read_timeout,
+                max_response_bytes,
+                pinned_ips=pre_ips,
+                public_ip_checker=is_public_ip_address,
+                socket_factory=socket_factory,
+                ssl_wrapper=ssl_wrapper,
+            )
 
+        post_ips = _verify_post_request_dns_and_peer(parsed, pre_ips, raw, resolver)
         if len(raw.body) > max_response_bytes:
             raise UltimateMCPError(
                 ErrorCode.RESOURCE_LIMIT_EXCEEDED,
@@ -450,10 +448,7 @@ def fetch_safe_url(
                     ErrorCode.RESOURCE_LIMIT_EXCEEDED,
                     f"Exceeded maximum redirects ({max_redirects}).",
                 )
-            location = next(
-                (v for k, v in raw.headers.items() if k.lower() == "location"),
-                None,
-            )
+            location = next((v for k, v in raw.headers.items() if k.lower() == "location"), None)
             if not location:
                 raise UltimateMCPError(
                     ErrorCode.UPSTREAM_INVALID_RESPONSE,
@@ -464,37 +459,11 @@ def fetch_safe_url(
             continue
 
         if raw.status_code >= 400:
-            retryable = raw.status_code in (429, 500, 502, 503, 504)
-            code = (
-                ErrorCode.RATE_LIMITED
-                if raw.status_code == 429
-                else (
-                    ErrorCode.NOT_FOUND
-                    if raw.status_code == 404
-                    else ErrorCode.UPSTREAM_INVALID_RESPONSE
-                )
-            )
-            details: dict[str, Any] = {
-                "status_code": raw.status_code,
-                "url": normalized_url,
-            }
-            retry_after = next(
-                (v for k, v in raw.headers.items() if k.lower() == "retry-after"),
-                None,
-            )
-            if retry_after:
-                details["retry_after"] = retry_after
-            raise UltimateMCPError(
-                code,
-                f"Upstream returned HTTP {raw.status_code} for '{normalized_url}'.",
-                retryable=retryable,
-                details=details,
-            )
+            _raise_for_error_status(raw, normalized_url)
 
         content_type = _extract_content_type(raw.headers)
         if allowed_content_types is not None and content_type:
-            allowed_norm = {ct.lower() for ct in allowed_content_types}
-            if content_type not in allowed_norm:
+            if content_type not in {ct.lower() for ct in allowed_content_types}:
                 raise UltimateMCPError(
                     ErrorCode.UNSUPPORTED_FORMAT,
                     f"Disallowed or unsupported Content-Type '{content_type}'.",
@@ -516,6 +485,6 @@ def fetch_safe_url(
             body=raw.body,
             text=decoded_text,
             redirect_count=redirect_count,
-            resolved_ips=tuple(post_ips),
+            resolved_ips=post_ips,
             retrieved_at=datetime.now(UTC).isoformat(),
         )

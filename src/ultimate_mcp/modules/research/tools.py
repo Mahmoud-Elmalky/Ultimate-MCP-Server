@@ -96,7 +96,14 @@ def register_research_tools(
             handler=web_search_service,
             mcp_wrapper=web_search,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {
+                    ProfileName.SEARCH,
+                    ProfileName.WEB_RESEARCH,
+                    ProfileName.RESEARCH,
+                    ProfileName.FULL,
+                }
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -142,7 +149,9 @@ def register_research_tools(
             handler=search_news_service,
             mcp_wrapper=search_news,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.SEARCH, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -195,7 +204,14 @@ def register_research_tools(
             handler=search_official_docs_service,
             mcp_wrapper=search_official_docs,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.CODING, ProfileName.FULL}),
+            profiles=frozenset(
+                {
+                    ProfileName.SEARCH,
+                    ProfileName.RESEARCH,
+                    ProfileName.CODING,
+                    ProfileName.FULL,
+                }
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -240,7 +256,9 @@ def register_research_tools(
             handler=search_academic_service,
             mcp_wrapper=search_academic,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.SEARCH, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -290,7 +308,14 @@ def register_research_tools(
             handler=multi_search_service,
             mcp_wrapper=multi_search,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {
+                    ProfileName.SEARCH,
+                    ProfileName.FACT_CHECK,
+                    ProfileName.RESEARCH,
+                    ProfileName.FULL,
+                }
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -334,7 +359,14 @@ def register_research_tools(
             handler=read_webpage_service,
             mcp_wrapper=read_webpage,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {
+                    ProfileName.WEB_RESEARCH,
+                    ProfileName.FACT_CHECK,
+                    ProfileName.RESEARCH,
+                    ProfileName.FULL,
+                }
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -375,7 +407,9 @@ def register_research_tools(
             handler=extract_links_service,
             mcp_wrapper=extract_links,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.WEB_RESEARCH, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -412,7 +446,9 @@ def register_research_tools(
             handler=extract_tables_service,
             mcp_wrapper=extract_tables,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.WEB_RESEARCH, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -456,7 +492,9 @@ def register_research_tools(
             handler=crawl_website_service,
             mcp_wrapper=crawl_website,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.WEB_RESEARCH, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -500,7 +538,9 @@ def register_research_tools(
             handler=rss_search_service,
             mcp_wrapper=rss_search,
             permission=PermissionLevel.L0_READ,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.WEB_RESEARCH, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -533,13 +573,16 @@ def register_research_tools(
             name="compare_sources",
             module="research",
             description=(
-                "Compare 2-10 supplied source excerpts deterministically, identifying shared and "
-                "unique terms while retaining citations."
+                "Compare 2-10 supplied source excerpts deterministically using lexical overlap, "
+                "negation, numeric, and date consistency checks ('Sources agree', "
+                "'Sources disagree', or 'Insufficient evidence'; not a semantic truth oracle)."
             ),
             handler=compare_sources_service,
             mcp_wrapper=compare_sources,
             permission=PermissionLevel.L1_PREPARE,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.FACT_CHECK, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.LOCAL,
             idempotent=True,
             produces_provenance=True,
@@ -581,13 +624,17 @@ def register_research_tools(
             name="verify_claim",
             module="research",
             description=(
-                "Gather evidence across independent domains for a claim and report overlap and "
-                "uncertainty (evidence helper, not a truth oracle)."
+                "Gather evidence across independent domains for a claim and classify status as "
+                "'Supporting evidence found', 'Conflicting evidence found', or 'Insufficient "
+                "evidence' via deterministic lexical/negation/numeric checks (not a semantic "
+                "truth oracle)."
             ),
             handler=verify_claim_service,
             mcp_wrapper=verify_claim,
             permission=PermissionLevel.L1_PREPARE,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.FACT_CHECK, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -636,7 +683,9 @@ def register_research_tools(
             handler=deep_research_service,
             mcp_wrapper=deep_research,
             permission=PermissionLevel.L1_PREPARE,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.FACT_CHECK, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.NETWORK,
             idempotent=True,
             produces_provenance=True,
@@ -683,7 +732,9 @@ def register_research_tools(
             handler=research_report_service,
             mcp_wrapper=research_report,
             permission=PermissionLevel.L1_PREPARE,
-            profiles=frozenset({ProfileName.RESEARCH, ProfileName.FULL}),
+            profiles=frozenset(
+                {ProfileName.FACT_CHECK, ProfileName.RESEARCH, ProfileName.FULL}
+            ),
             timeout_category=TimeoutCategory.LOCAL,
             idempotent=True,
             produces_provenance=True,
