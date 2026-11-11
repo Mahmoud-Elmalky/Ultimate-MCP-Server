@@ -1,2 +1,9 @@
 .env
 __pycache__/
+
+# Local virtual environments and tool caches
+.venv/
+.venv-*/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
